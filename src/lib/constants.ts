@@ -1,4 +1,5 @@
 import type {
+  BusinessKind,
   Channel,
   CustomerType,
   ExpenseCategory,
@@ -9,6 +10,11 @@ import type {
 
 /** Nombre del producto; la marca de cada negocio sale de su configuración. */
 export const APP_NAME = "Boutique ERP";
+
+export const KIND_LABEL: Record<BusinessKind, string> = {
+  boutique: "Boutique",
+  restaurante: "Restaurante / cafetería",
+};
 
 /** Fixed order — matches the validated categorical palette in globals.css. */
 export const CHANNELS: Channel[] = ["tienda", "web", "instagram", "whatsapp", "mayoreo"];

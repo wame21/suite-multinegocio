@@ -8,10 +8,14 @@ import { fDate, mxn } from "@/lib/format";
 import { daysLeft, STATE_LABELS } from "@/lib/membership";
 import { useErp } from "@/lib/store";
 
-const INCLUDED = ["Panel general", "Punto de venta", "Pedidos", "Inventario", "Clientes", "Mayoreo", "Finanzas", "Reportes", "Equipo y sucursales"];
+const INCLUDED = {
+  boutique: ["Panel general", "Punto de venta", "Pedidos", "Inventario", "Clientes", "Mayoreo", "Finanzas", "Reportes", "Equipo y sucursales"],
+  restaurante: ["Panel general", "Menú y modificadores", "Mesas y QR", "Caja", "Cocina", "Mesas en vivo", "Finanzas", "Reportes", "Equipo"],
+};
 
 export function MembresiaSection() {
   const m = useErp((s) => s.membership);
+  const kind = useErp((s) => s.kind);
   if (!m) return null;
 
   const ends = m.paidUntil ?? m.trialEndsAt;
@@ -34,7 +38,7 @@ export function MembresiaSection() {
         </CardHeader>
         <CardContent>
           <ul className="grid gap-1.5 text-sm sm:grid-cols-2 md:grid-cols-3">
-            {INCLUDED.map((k) => (
+            {INCLUDED[kind].map((k) => (
               <li key={k} className="flex items-center gap-2">
                 <Check className="size-3.5 text-gold" /> {k}
               </li>

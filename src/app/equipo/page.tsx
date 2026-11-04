@@ -9,19 +9,33 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { navFor } from "@/lib/access";
 import { fDate } from "@/lib/format";
 import { errorMessage, useActiveBranches, useBranches, useErp } from "@/lib/store";
-import type { AppRole, BranchId, Profile } from "@/lib/types";
+import type { AppRole, BranchId, Profile, Role } from "@/lib/types";
 
-const ROLE_LABEL: Record<AppRole, string> = { dueno: "Dueño", vendedor: "Vendedor", pendiente: "Pendiente" };
+const ROLE_LABEL: Record<AppRole, string> = {
+  dueno: "Dueño",
+  vendedor: "Vendedor",
+  encargado: "Encargado",
+  mesero: "Mesero",
+  cajero: "Cajero",
+  cocina: "Cocina",
+  pendiente: "Pendiente",
+};
 
 /** Valor del selector para "sin sucursal" (Radix no admite valores vacíos). */
 const NO_BRANCH = "none";
+
+/** Puestos que el dueño puede asignar según el giro. */
+const ASSIGNABLE = { boutique: ["vendedor", "encargado"], restaurante: ["mesero", "cajero", "cocina"] } as const;
+const APPROVED_ROLES: Role[] = ["dueno", "cajero", "mesero", "cocina"];
 
 export default function EquipoPage() {
   const team = useErp((s) => s.team);
   const loadTeam = useErp((s) => s.loadTeam);
   const me = useErp((s) => s.profile?.id);
+  const resto = useErp((s) => s.kind) === "restaurante";
 
   const [loadError, setLoadError] = useState(false);
 
@@ -38,7 +52,11 @@ export default function EquipoPage() {
     <>
       <PageHeader
         title="Equipo"
-        description="Quien se registra con el código de tu negocio queda pendiente. Apruébalo como vendedor y asígnale su sucursal; los vendedores no ven costos, utilidades ni gastos."
+        description={
+          resto
+            ? "Cada quien ve solo lo que necesita para su puesto. Quien se registra con el código queda pendiente: asígnale Mesero, Cajero o Cocina."
+            : "Quien se registra con el código de tu negocio queda pendiente. Apruébalo como vendedor o encargado y asígnale su sucursal; ninguno ve costos, utilidades ni gastos. El encargado además mueve inventario y cancela pedidos."
+        }
       />
       <InviteCard />
       {pendientes > 0 && (
@@ -56,7 +74,7 @@ export default function EquipoPage() {
                 <TableHead className="pl-4">Nombre</TableHead>
                 <TableHead>Alta</TableHead>
                 <TableHead>Rol</TableHead>
-                <TableHead className="pr-4">Sucursal</TableHead>
+                {!resto && <TableHead className="pr-4">Sucursal</TableHead>}
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -67,6 +85,7 @@ export default function EquipoPage() {
           </Table>
         )}
       </Card>
+      {resto && <RoleMatrix />}
     </>
   );
 }
@@ -141,8 +160,46 @@ function InviteCard() {
   );
 }
 
+/** Qué módulos abre cada puesto del restaurante: sale del mismo menú que usa la barra lateral. */
+function RoleMatrix() {
+  const modules = navFor("restaurante", "dueno").flatMap((g) => g.items);
+  return (
+    <Card className="mt-6 gap-3 p-4">
+      <h2 className="text-sm font-semibold">Qué ve cada puesto</h2>
+      <div className="overflow-x-auto">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Puesto</TableHead>
+              {modules.map((m) => (
+                <TableHead key={m.href} className="text-center">{m.label}</TableHead>
+              ))}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {APPROVED_ROLES.map((role) => {
+              const mine = new Set(navFor("restaurante", role).flatMap((g) => g.items.map((i) => i.href)));
+              return (
+                <TableRow key={role}>
+                  <TableCell className="font-medium">{ROLE_LABEL[role]}</TableCell>
+                  {modules.map((m) => (
+                    <TableCell key={m.href} className={mine.has(m.href) ? "text-center text-success" : "text-center text-muted-foreground/50"}>
+                      {mine.has(m.href) ? "✓" : "—"}
+                    </TableCell>
+                  ))}
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </div>
+    </Card>
+  );
+}
+
 function MemberRow({ member, self }: { member: Profile; self: boolean }) {
   const setMember = useErp((s) => s.setMember);
+  const resto = useErp((s) => s.kind) === "restaurante";
   const active = useActiveBranches();
   const all = useBranches();
   const [saving, setSaving] = useState(false);
@@ -156,7 +213,7 @@ function MemberRow({ member, self }: { member: Profile; self: boolean }) {
     try {
       await setMember(member.id, role, branch);
       toast.success(
-        role === "vendedor" && member.role === "pendiente" ? `${member.name} ya puede entrar` : `${member.name} actualizado`,
+        role !== "pendiente" && member.role === "pendiente" ? `${member.name} ya puede entrar` : `${member.name} actualizado`,
       );
     } catch (e) {
       toast.error(errorMessage(e));
@@ -185,13 +242,15 @@ function MemberRow({ member, self }: { member: Profile; self: boolean }) {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="vendedor">Vendedor</SelectItem>
+              {ASSIGNABLE[resto ? "restaurante" : "boutique"].map((r) => (
+                <SelectItem key={r} value={r}>{ROLE_LABEL[r]}</SelectItem>
+              ))}
               <SelectItem value="pendiente">Pendiente (sin acceso)</SelectItem>
             </SelectContent>
           </Select>
         )}
       </TableCell>
-      <TableCell className="pr-4">
+      {!resto && <TableCell className="pr-4">
         {locked ? (
           <span className="text-muted-foreground">Todas</span>
         ) : (
@@ -218,7 +277,7 @@ function MemberRow({ member, self }: { member: Profile; self: boolean }) {
             </SelectContent>
           </Select>
         )}
-      </TableCell>
+      </TableCell>}
     </TableRow>
   );
 }

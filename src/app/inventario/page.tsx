@@ -38,7 +38,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { fDateTime, mxn, num, pct } from "@/lib/format";
 import { inventoryValue, replenishment } from "@/lib/metrics";
-import { errorMessage, useActiveBranches, useBranchName, useErp, useIsOwner, useWarehouse } from "@/lib/store";
+import { errorMessage, useActiveBranches, useBranchName, useCanMoveStock, useErp, useIsOwner, useWarehouse } from "@/lib/store";
 import type { BranchId, Category, MovementType, Product, StockMap } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { hasKeySeparator, productStock, stockOf, variantKey, type QtyMap } from "@/lib/variants";
@@ -377,6 +377,7 @@ function ProductSheet({ product }: { product: Product }) {
   const movements = useErp((s) => s.movements);
   const updateProduct = useErp((s) => s.updateProduct);
   const owner = useIsOwner();
+  const canMoveStock = useCanMoveStock();
   const branches = useActiveBranches();
   const branchName = useBranchName();
   const [view, setView] = useState<BranchId | "all">("all");
@@ -393,11 +394,13 @@ function ProductSheet({ product }: { product: Product }) {
         </SheetDescription>
       </SheetHeader>
       <div className="flex flex-col gap-5 px-4 pb-6">
-        <div className="flex flex-wrap gap-2">
-          <StockMoveDialog product={product} kind="entrada" />
-          <StockMoveDialog product={product} kind="traspaso" />
-          <StockMoveDialog product={product} kind="ajuste" />
-        </div>
+        {canMoveStock && (
+          <div className="flex flex-wrap gap-2">
+            <StockMoveDialog product={product} kind="entrada" />
+            <StockMoveDialog product={product} kind="traspaso" />
+            <StockMoveDialog product={product} kind="ajuste" />
+          </div>
+        )}
 
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-center justify-between gap-2">

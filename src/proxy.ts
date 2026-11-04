@@ -1,11 +1,21 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
-
-const PUBLIC_PATHS = ["/login"];
+import { isPublicPath } from "@/components/comensal/public-path";
+import { buildCsp } from "@/lib/csp";
 
 /** Refresca la sesión de Supabase en cada visita y manda a /login a quien no ha entrado. */
 export async function proxy(request: NextRequest) {
-  let response = NextResponse.next({ request });
+  // Nonce nuevo por petición: Next lo lee de la CSP de la petición y lo pone en sus scripts (el layout lo pasa a next-themes).
+  const nonce = btoa(crypto.randomUUID());
+  const csp = buildCsp({ nonce, supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL!, dev: process.env.NODE_ENV === "development" });
+  request.headers.set("x-nonce", nonce);
+  request.headers.set("Content-Security-Policy", csp);
+  const next = () => {
+    const res = NextResponse.next({ request });
+    res.headers.set("Content-Security-Policy", csp);
+    return res;
+  };
+  let response = next();
 
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -15,7 +25,7 @@ export async function proxy(request: NextRequest) {
         getAll: () => request.cookies.getAll(),
         setAll(cookiesToSet, headers) {
           for (const { name, value } of cookiesToSet) request.cookies.set(name, value);
-          response = NextResponse.next({ request });
+          response = next();
           for (const { name, value, options } of cookiesToSet) response.cookies.set(name, value, options);
           for (const [key, value] of Object.entries(headers)) response.headers.set(key, value);
         },
@@ -26,10 +36,10 @@ export async function proxy(request: NextRequest) {
   const { data } = await supabase.auth.getClaims();
   const signedIn = Boolean(data?.claims);
   const { pathname } = request.nextUrl;
-  const isPublic = PUBLIC_PATHS.includes(pathname);
+  const isPublic = isPublicPath(pathname);
 
   if (!signedIn && !isPublic) return redirectKeepingCookies(request, response, "/login");
-  if (signedIn && isPublic) return redirectKeepingCookies(request, response, "/");
+  if (signedIn && pathname === "/login") return redirectKeepingCookies(request, response, "/");
   return response;
 }
 

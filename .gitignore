@@ -48,3 +48,7 @@ supabase/*
 !supabase/migrations
 !supabase/functions
 !supabase/config.toml
+
+# Reportes de auditoría y de diseño: describen fallas abiertas y el repo es público
+.audit/
+.design/

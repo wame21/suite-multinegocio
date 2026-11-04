@@ -91,7 +91,9 @@ enabled = true
 # max_header_length = 4096
 
 [studio]
-enabled = true
+# Apagado: Kong local publica pg-meta (/pg/query) SIN autenticación en 0.0.0.0:54321 y ejecuta SQL de cualquiera en la red.
+# Para usar Studio ponlo en true SOLO con el firewall de deploy/README.md activo.
+enabled = false
 # Port to use for Supabase Studio.
 port = 54323
 # External URL of the API server that frontend connects to.
@@ -125,7 +127,8 @@ file_size_limit = "50MiB"
 
 # Allow connections via S3 compatible clients
 [storage.s3_protocol]
-enabled = true
+# Apagado: sus llaves S3 de fábrica del CLI son públicas y no se pueden cambiar; la app no usa S3.
+enabled = false
 
 # Image transformation API is available to Supabase Pro plan.
 # [storage.image_transformation]
@@ -155,11 +158,17 @@ max_indexes = 5
 enabled = true
 # The base URL of your website. Used as an allow-list for redirects and for constructing URLs used
 # in emails.
-site_url = "http://127.0.0.1:3000"
+site_url = "env(SITE_URL)"
 # The public URL that Auth serves on. Defaults to the API external URL with `/auth/v1` appended.
 # external_url = ""
 # A list of *exact* URLs that auth providers are permitted to redirect to post authentication.
-additional_redirect_urls = ["https://127.0.0.1:3000"]
+additional_redirect_urls = ["env(REDIRECT_URL)"]
+# Llaves PROPIAS (valores en supabase/.env, ignorado por git). Las de fábrica del CLI son públicas.
+jwt_secret = "env(SUPABASE_JWT_SECRET)"
+anon_key = "env(SUPABASE_ANON_KEY)"
+service_role_key = "env(SUPABASE_SERVICE_ROLE_KEY)"
+publishable_key = "env(SUPABASE_PUBLISHABLE_KEY)"
+secret_key = "env(SUPABASE_SECRET_KEY)"
 # How long tokens are valid for, in seconds. Defaults to 3600 (1 hour), maximum 604,800 (1 week).
 jwt_expiry = 3600
 # JWT issuer URL. If not set, defaults to auth.external_url.
@@ -178,10 +187,10 @@ enable_anonymous_sign_ins = false
 # Allow/disallow testing manual linking of accounts
 enable_manual_linking = false
 # Passwords shorter than this value will be rejected as weak. Minimum 6, recommended 8 or more.
-minimum_password_length = 6
+minimum_password_length = 10
 # Passwords that do not meet the following requirements will be rejected as weak. Supported values
 # are: `letters_digits`, `lower_upper_letters_digits`, `lower_upper_letters_digits_symbols`
-password_requirements = ""
+password_requirements = "letters_digits"
 
 # Configure passkey sign-ins.
 # [auth.passkey]
@@ -210,10 +219,10 @@ token_verifications = 30
 web3 = 30
 
 # Configure one of the supported captcha providers: `hcaptcha`, `turnstile`.
-# [auth.captcha]
-# enabled = true
-# provider = "hcaptcha"
-# secret = ""
+[auth.captcha]
+enabled = true
+provider = "turnstile"
+secret = "env(TURNSTILE_SECRET)"
 
 [auth.email]
 # Allow/disallow new user signups via email to your project.
@@ -386,6 +395,10 @@ deno_version = 2
 
 # El login consulta códigos sin sesión y la llave publicable no es un JWT.
 [functions.invite-lookup]
+verify_jwt = false
+
+# El comensal pide desde el QR de la mesa sin sesión.
+[functions.table-order]
 verify_jwt = false
 
 [analytics]

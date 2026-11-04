@@ -3,29 +3,20 @@
 import {
   AlertTriangle,
   Ban,
-  BarChart3,
-  Boxes,
+  ChevronLeft,
   CreditCard,
-  FileText,
   Hourglass,
-  LayoutDashboard,
   Lock,
   LogOut,
   Menu,
   Moon,
   RefreshCw,
-  Settings,
   ShieldCheck,
-  ShoppingBag,
-  Store,
   Sun,
-  UserCog,
-  Users,
-  Wallet,
   WifiOff,
 } from "lucide-react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useTheme } from "next-themes";
 import { useEffect, useState, type ReactNode } from "react";
 import { BrandLockup, BrandMark } from "@/components/brand";
@@ -41,49 +32,21 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
+import { canOpen, homeFor, navFor, pathMatches } from "@/lib/access";
+import { KIND_LABEL } from "@/lib/constants";
 import { mxn } from "@/lib/format";
-import { amountDue, dueLabel, graceNotice, isBlocked, needsPayment } from "@/lib/membership";
+import { amountDue, dueLabel, graceNotice, isBlocked, needsPayment, STATE_LABELS } from "@/lib/membership";
 import { useBusinessName, useErp, useWholesaleEnabled } from "@/lib/store";
 import { supabase } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
 
-interface NavItem {
-  href: string;
-  label: string;
-  icon: typeof LayoutDashboard;
-  ownerOnly?: boolean;
-  wholesaleOnly?: boolean;
-  badge?: "orders" | "quotes";
-}
-
-const NAV: { section: string; items: NavItem[] }[] = [
-  {
-    section: "Operación",
-    items: [
-      { href: "/", label: "Panel general", icon: LayoutDashboard },
-      { href: "/pedidos", label: "Pedidos", icon: ShoppingBag, badge: "orders" },
-      { href: "/pos", label: "Punto de venta", icon: Store },
-      { href: "/inventario", label: "Inventario", icon: Boxes },
-      { href: "/mayoreo", label: "Mayoreo", icon: FileText, badge: "quotes", wholesaleOnly: true },
-      { href: "/clientes", label: "Clientes", icon: Users },
-    ],
-  },
-  {
-    section: "Negocio",
-    items: [
-      { href: "/finanzas", label: "Finanzas", icon: Wallet, ownerOnly: true },
-      { href: "/reportes", label: "Reportes", icon: BarChart3, ownerOnly: true },
-      { href: "/equipo", label: "Equipo", icon: UserCog, ownerOnly: true },
-      { href: "/configuracion", label: "Configuración", icon: Settings, ownerOnly: true },
-    ],
-  },
-];
-
-const NAV_ITEMS = NAV.flatMap((g) => g.items);
-const OWNER_ONLY = NAV_ITEMS.filter((i) => i.ownerOnly).map((i) => i.href);
 /** Rutas que se muestran sin el menú lateral ni la carga de datos. */
 const BARE_PATHS = ["/login", "/admin"];
-const isActive = (href: string, pathname: string) => (href === "/" ? pathname === "/" : pathname.startsWith(href));
+/** Cuenta del dueño (/negocios) y menú público del comensal (/m/...) tienen su propio marco. */
+const isBare = (pathname: string) =>
+  BARE_PATHS.includes(pathname) || pathname === "/negocios" || pathname.startsWith("/negocios/") || pathname.startsWith("/m/");
+
+const ROLE_NAME: Record<string, string> = { vendedor: "Vendedor", encargado: "Encargado", mesero: "Mesero", cajero: "Cajero", cocina: "Cocina" };
 
 const HEX = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
 
@@ -150,18 +113,19 @@ function useNavBadges() {
 function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname();
   const role = useErp((s) => s.role);
+  const kind = useErp((s) => s.kind);
   const wholesale = useWholesaleEnabled();
   const badges = useNavBadges();
 
   return (
     <nav className="flex flex-col gap-6">
-      {NAV.map((group) => (
+      {navFor(kind, role).map((group) => (
         <div key={group.section} className="flex flex-col gap-1">
           <div className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-sidebar-foreground/70">
             {group.section}
           </div>
           {group.items.filter((item) => wholesale || !item.wholesaleOnly).map((item) => {
-            const active = isActive(item.href, pathname);
+            const active = pathMatches(item.href, pathname);
             const locked = item.ownerOnly && role !== "dueno";
             const count = item.badge ? badges[item.badge] : 0;
             return (
@@ -193,10 +157,35 @@ function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
   );
 }
 
+/** Solo para el dueño: vuelve a "Mis negocios" y muestra en qué negocio está. */
+function BusinessSelector({ onNavigate }: { onNavigate?: () => void }) {
+  const active = useErp((s) => s.active);
+  const businessName = useBusinessName();
+  if (!active) return null;
+  return (
+    <div className="flex flex-col gap-1 rounded-2xl bg-sidebar-accent/60 p-2 ring-1 ring-sidebar-border">
+      <Link href="/negocios" onClick={onNavigate} className="flex h-6 items-center gap-1 px-1 text-xs font-medium text-sidebar-foreground/70 hover:text-sidebar-foreground">
+        <ChevronLeft className="size-3.5" /> Mis negocios
+      </Link>
+      <div className="flex min-w-0 items-center gap-2 px-1">
+        <BrandMark className="size-8 text-xs" />
+        <div className="min-w-0 leading-tight">
+          <div className="truncate text-[13px] font-semibold">{businessName}</div>
+          <div className="truncate text-[11px] text-sidebar-foreground/60">
+            {KIND_LABEL[active.kind]} · {STATE_LABELS[active.state]}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const live = useErp((s) => s.live);
+  const owner = useErp((s) => s.role === "dueno");
   return (
     <div className="flex h-full flex-col gap-8 px-3 py-5 text-sidebar-foreground">
+      {owner && <BusinessSelector onNavigate={onNavigate} />}
       <div className="px-2">
         <BrandLockup />
       </div>
@@ -217,7 +206,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   );
 }
 
-function ThemeToggle() {
+export function ThemeToggle() {
   const { resolvedTheme, setTheme } = useTheme();
   const dark = resolvedTheme === "dark";
   return (
@@ -228,7 +217,7 @@ function ThemeToggle() {
 }
 
 /** Acceso al panel /admin, solo para administradores de la plataforma (la página vuelve a validar). */
-function AdminLink() {
+export function AdminLink() {
   const [admin, setAdmin] = useState(false);
   useEffect(() => {
     void supabase()
@@ -262,7 +251,7 @@ function UserMenu() {
           <span className="hidden text-left leading-tight sm:block">
             <span className="block text-xs font-medium">{profile.name}</span>
             <span className="block text-[10px] text-muted-foreground">
-              {owner ? "Dueño · acceso total" : branch ? `Vendedor · ${branch}` : "Vendedor"}
+              {owner ? "Dueño · acceso total" : branch ? `${ROLE_NAME[profile.role]} · ${branch}` : ROLE_NAME[profile.role]}
             </span>
           </span>
         </Button>
@@ -286,7 +275,7 @@ function Restricted() {
       </div>
       <h2 className="text-xl font-semibold">Sección exclusiva del dueño</h2>
       <p className="text-sm text-muted-foreground">
-        Los vendedores no pueden ver costos, utilidades ni gastos del negocio. Cada usuario ve solo lo que necesita para trabajar.
+        Vendedores y encargados no pueden ver costos, utilidades ni gastos del negocio. Cada usuario ve solo lo que necesita para trabajar.
       </p>
     </div>
   );
@@ -321,6 +310,17 @@ function MembershipNotice() {
   );
 }
 
+/** Botón a "Mis negocios" para el dueño, en las pantallas que le cierran el negocio activo. */
+function OwnerLink() {
+  const owner = useErp((s) => s.profile?.role === "dueno");
+  if (!owner) return null;
+  return (
+    <Button asChild variant="outline">
+      <Link href="/negocios">Mis negocios</Link>
+    </Button>
+  );
+}
+
 function FullScreen({ children }: { children: ReactNode }) {
   return (
     <div className="grid min-h-screen place-items-center px-4">
@@ -337,12 +337,27 @@ function DataGate({ children }: { children: ReactNode }) {
   const init = useErp((s) => s.init);
   const signOut = useErp((s) => s.signOut);
   const membership = useErp((s) => s.membership);
+  const active = useErp((s) => s.active);
+  const kind = useErp((s) => s.kind);
+  const role = useErp((s) => s.role);
+  const router = useRouter();
+  const pathname = usePathname();
+  // Cuenta de dueño sin negocio activo: su lugar es Mis negocios.
+  const toOwnerHome = status === "ready" && !!profile && !profile.businessId;
+  // Cada rol de restaurante abre solo sus rutas; boutique conserva las suyas.
+  const toRoleHome = status === "ready" && !!profile?.businessId && profile.role !== "pendiente" && !canOpen(kind, role, pathname);
 
   useEffect(() => {
-    void init();
+    // switchBusiness y Mis negocios ya dejan el store cargado o reiniciado: solo se carga si falta.
+    if (useErp.getState().status !== "ready") void init();
   }, [init]);
 
-  if (status === "loading") {
+  useEffect(() => {
+    if (toOwnerHome) router.replace("/negocios");
+    else if (toRoleHome) router.replace(homeFor(kind, role));
+  }, [toOwnerHome, toRoleHome, kind, role, router]);
+
+  if (status === "loading" || toOwnerHome || toRoleHome) {
     return (
       <FullScreen>
         <BrandMark className="size-14 animate-pulse text-xl" />
@@ -375,7 +390,8 @@ function DataGate({ children }: { children: ReactNode }) {
         <Hourglass className="size-8 text-gold" />
         <h2 className="text-xl font-semibold">Tu cuenta está pendiente</h2>
         <p className="text-sm text-muted-foreground">
-          Hola {profile.name}. El dueño del negocio debe aprobar tu acceso en la sección Equipo. Cuando lo haga, vuelve a revisar.
+          Hola {profile.name}. El dueño de <strong className="text-foreground">{active?.name ?? "tu negocio"}</strong> debe aprobar tu acceso y
+          asignarte un puesto en Equipo. Cuando lo haga, vuelve a revisar.
         </p>
         <div className="flex gap-2">
           <Button onClick={() => void init()}>
@@ -408,6 +424,7 @@ function DataGate({ children }: { children: ReactNode }) {
           <Button variant="outline" onClick={() => void signOut()}>
             <LogOut /> Cerrar sesión
           </Button>
+          <OwnerLink />
           <AdminLink />
         </div>
       </FullScreen>
@@ -437,6 +454,7 @@ function DataGate({ children }: { children: ReactNode }) {
           <Button variant="outline" onClick={() => void signOut()}>
             <LogOut /> Cerrar sesión
           </Button>
+          <OwnerLink />
           {/* El administrador de la plataforma puede reactivarse a sí mismo */}
           <AdminLink />
         </div>
@@ -447,53 +465,88 @@ function DataGate({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
+/** Marco con menú lateral (fijo en escritorio, cajón en celular) y barra superior; lo usan el negocio y la cuenta del dueño. */
+export function ShellFrame({
+  sidebar,
+  brand,
+  actions,
+  notice,
+  children,
+}: {
+  sidebar: (onNavigate?: () => void) => ReactNode;
+  brand: ReactNode;
+  actions: ReactNode;
+  notice?: ReactNode;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="min-h-screen">
+      <aside className="fixed inset-y-3 left-3 z-30 hidden w-64 overflow-hidden rounded-[26px] border border-sidebar-border bg-sidebar bg-(image:--glass-sheen) shadow-(--glass-shadow) backdrop-blur-[28px] backdrop-saturate-[1.85] print:hidden lg:block">
+        {sidebar()}
+      </aside>
+      <div className="lg:pl-[17.5rem]">
+        <div className="sticky top-0 z-20 print:hidden">
+          {notice}
+          <header className="mx-3 mt-3 flex h-14 items-center gap-3 rounded-[20px] border border-(--glass-edge) bg-card bg-(image:--glass-sheen) px-3 shadow-(--glass-shadow) backdrop-blur-[28px] backdrop-saturate-[1.85] md:px-4 lg:ml-0">
+            <Sheet open={open} onOpenChange={setOpen}>
+              <SheetTrigger asChild>
+                <Button variant="ghost" size="icon" className="lg:hidden" aria-label="Abrir menú">
+                  <Menu />
+                </Button>
+              </SheetTrigger>
+              <SheetContent side="left" className="w-72 border-sidebar-border bg-sidebar bg-(image:--glass-sheen) p-0" showCloseButton={false}>
+                <SheetTitle className="sr-only">Menú</SheetTitle>
+                {sidebar(() => setOpen(false))}
+              </SheetContent>
+            </Sheet>
+            <div className="flex min-w-0 items-center gap-2 lg:hidden">{brand}</div>
+            <div className="ml-auto flex items-center gap-1.5">{actions}</div>
+          </header>
+        </div>
+        <main className="mx-auto w-full max-w-[1400px] px-4 py-6 md:px-6 md:py-8">{children}</main>
+      </div>
+    </div>
+  );
+}
+
+/** Rutas de boutique que el personal (vendedor o encargado) ve bloqueadas. */
+const OWNER_ONLY = navFor("boutique", "dueno")
+  .flatMap((g) => g.items)
+  .filter((i) => i.ownerOnly)
+  .map((i) => i.href);
+
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const role = useErp((s) => s.role);
+  const kind = useErp((s) => s.kind);
   const businessName = useBusinessName();
-  const [open, setOpen] = useState(false);
-  const locked = role !== "dueno" && OWNER_ONLY.some((p) => pathname.startsWith(p));
+  const locked = kind === "boutique" && role !== "dueno" && OWNER_ONLY.some((p) => pathname.startsWith(p));
 
-  if (BARE_PATHS.includes(pathname)) return <>{children}</>;
+  if (isBare(pathname)) return <>{children}</>;
 
   return (
     <DataGate>
       <AccentTheme />
-      <div className="min-h-screen">
-        <aside className="fixed inset-y-3 left-3 z-30 hidden w-64 overflow-hidden rounded-[26px] border border-sidebar-border bg-sidebar bg-(image:--glass-sheen) shadow-(--glass-shadow) backdrop-blur-[28px] backdrop-saturate-[1.85] print:hidden lg:block">
-          <SidebarBody />
-        </aside>
-        <div className="lg:pl-[17.5rem]">
-          <div className="sticky top-0 z-20 print:hidden">
-            <MembershipNotice />
-            <header className="mx-3 mt-3 flex h-14 items-center gap-3 rounded-[20px] border border-(--glass-edge) bg-card bg-(image:--glass-sheen) px-3 shadow-(--glass-shadow) backdrop-blur-[28px] backdrop-saturate-[1.85] md:px-4 lg:ml-0">
-              <Sheet open={open} onOpenChange={setOpen}>
-                <SheetTrigger asChild>
-                  <Button variant="ghost" size="icon" className="lg:hidden" aria-label="Abrir menú">
-                    <Menu />
-                  </Button>
-                </SheetTrigger>
-                <SheetContent side="left" className="w-72 border-sidebar-border bg-sidebar bg-(image:--glass-sheen) p-0" showCloseButton={false}>
-                  <SheetTitle className="sr-only">Menú</SheetTitle>
-                  <SidebarBody onNavigate={() => setOpen(false)} />
-                </SheetContent>
-              </Sheet>
-              <div className="flex min-w-0 items-center gap-2 lg:hidden">
-                <BrandMark className="size-7 text-xs" />
-                <span className="truncate font-display text-base font-bold uppercase tracking-[0.08em]">{businessName}</span>
-              </div>
-              <div className="ml-auto flex items-center gap-1.5">
-                <AdminLink />
-                <ThemeToggle />
-                <UserMenu />
-              </div>
-            </header>
-          </div>
-          <main className="mx-auto w-full max-w-[1400px] px-4 py-6 md:px-6 md:py-8">
-            {locked ? <Restricted /> : children}
-          </main>
-        </div>
-      </div>
+      <ShellFrame
+        sidebar={(onNavigate) => <SidebarBody onNavigate={onNavigate} />}
+        notice={<MembershipNotice />}
+        brand={
+          <>
+            <BrandMark className="size-7 text-xs" />
+            <span className="truncate font-display text-base font-bold uppercase tracking-[0.08em]">{businessName}</span>
+          </>
+        }
+        actions={
+          <>
+            <AdminLink />
+            <ThemeToggle />
+            <UserMenu />
+          </>
+        }
+      >
+        {locked ? <Restricted /> : children}
+      </ShellFrame>
     </DataGate>
   );
 }

@@ -8,6 +8,8 @@ import {
   useBranches,
   useBranchName,
   useBusinessName,
+  useCanCancelOrders,
+  useCanMoveStock,
   useCategories,
   useChannels,
   useErp,
@@ -70,10 +72,21 @@ describe("useIsOwner y useBusinessName", () => {
     expect(view.result.current).toBe(true);
   });
 
+  it.each([
+    ["dueno", true],
+    ["encargado", true],
+    ["vendedor", false],
+    ["cajero", false],
+  ] as const)("useCanMoveStock y useCanCancelOrders con rol %s → %s", (role, allowed) => {
+    act(() => useErp.setState({ role }));
+    expect(hook(useCanMoveStock).view.result.current).toBe(allowed);
+    expect(hook(useCanCancelOrders).view.result.current).toBe(allowed);
+  });
+
   it("useBusinessName usa APP_NAME sin negocio y el nombre cuando carga", () => {
     const { view } = hook(useBusinessName);
     expect(view.result.current).toBe(APP_NAME);
-    act(() => useErp.setState({ business: { id: "b-1", name: "Boutique Aurora", inviteCode: "ABCD2345", orderPrefix: "V-", quotePrefix: "COT-" } }));
+    act(() => useErp.setState({ business: { id: "b-1", name: "Boutique Aurora", kind: "boutique", inviteCode: "ABCD2345", orderPrefix: "V-", quotePrefix: "COT-" } }));
     expect(view.result.current).toBe("Boutique Aurora");
   });
 });

@@ -8,28 +8,27 @@ El diseño completo (tablas, políticas, funciones y contrato con la app) está 
 
 ## Montarlo
 
-Requisitos: Node 20+, [pnpm](https://pnpm.io) y una cuenta de [Supabase](https://supabase.com).
+Requisitos: Node 22+, [pnpm](https://pnpm.io) y una cuenta de [Supabase](https://supabase.com).
 
 1. **Crea un proyecto de Supabase** y copia la URL y la llave publicable (*Project Settings → API*).
-2. **Aplica las migraciones** de [`supabase/migrations/`](supabase/migrations), en orden:
+2. **Aplica las migraciones:** todas las de [`supabase/migrations/`](supabase/migrations), en orden (el nombre de cada archivo empieza con su fecha).
 
-   | Migración | Contenido |
-   |---|---|
-   | `…_esquema.sql` | negocios, perfiles, sucursales, catálogo, inventario, ventas, mayoreo, gastos y alta de usuarios |
-   | `…_seguridad.sql` | RLS por negocio y rol, código de invitación, edición del negocio y del equipo |
-   | `…_operaciones.sql` | funciones atómicas: pedidos, pagos, traspasos, conteos y cotizaciones |
-   | `…_storage.sql` | bucket público `logos` (solo imágenes de hasta 2 MB; cada dueño escribe en la carpeta de su negocio) |
+   Con la CLI de Supabase: `pnpm exec supabase link --project-ref <ref>` y `pnpm exec supabase db push`. También puedes pegar cada archivo en el *SQL Editor*, uno por uno y en el mismo orden. El bucket de logotipos lo crea una migración; no hay que crearlo a mano.
+3. **Despliega las Edge Functions** (validan el código de invitación y reciben los pedidos de mesa; son públicas, por eso van sin verificar JWT):
 
-   Con la CLI de Supabase: `pnpm exec supabase link --project-ref <ref>` y `pnpm exec supabase db push`. También puedes pegar cada archivo en el *SQL Editor*, uno por uno y en el mismo orden. El bucket de logotipos lo crea la migración; no hay que crearlo a mano.
-3. **Variables de entorno:** copia `.env.example` a `.env.local` y llena los valores.
+   ```bash
+   pnpm exec supabase functions deploy invite-lookup --no-verify-jwt
+   pnpm exec supabase functions deploy table-order --no-verify-jwt
+   ```
+4. **Variables de entorno:** copia `.env.example` a `.env.local` y llena los valores.
 
    | Variable | Qué es |
    |---|---|
    | `NEXT_PUBLIC_SUPABASE_URL` | URL del proyecto |
    | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | llave publicable (anon) del proyecto |
 
-4. **Autenticación:** en *Authentication → Providers → Email* deja activo el registro con correo. Si no quieres confirmar correos al probar, desactiva *Confirm email*.
-5. **Arranca la app:**
+5. **Autenticación:** en *Authentication → Providers → Email* deja activo el registro con correo. *Confirm email* solo debe estar apagado mientras no tengas SMTP propio (el de Supabase tiene un límite muy bajo de correos); en cuanto configures tu SMTP, actívalo.
+6. **Arranca la app:**
 
    ```bash
    pnpm install
@@ -49,7 +48,8 @@ Requisitos: Node 20+, [pnpm](https://pnpm.io) y una cuenta de [Supabase](https:/
 2. Quien va a colaborar elige **Registrarme → Unirme a un negocio**, escribe el código y crea su cuenta. La pantalla le muestra el nombre del negocio antes de enviar.
 3. La cuenta nueva queda **pendiente** y no ve datos hasta que el dueño la apruebe en **Equipo**, donde asigna rol y sucursal:
    - **Dueño:** todo su negocio, incluidos costos, utilidades, finanzas, reportes, equipo y configuración.
-   - **Vendedor:** opera ventas, clientes, cotizaciones y ajustes de inventario, sin ver costos ni finanzas. En el punto de venta solo cobra en su sucursal asignada.
+   - **Vendedor:** opera ventas, clientes y cotizaciones, sin ver costos ni finanzas. En el punto de venta solo cobra en su sucursal asignada.
+   - **Encargado:** lo mismo que el vendedor y además mueve inventario (entradas, ajustes, conteos y traspasos) en cualquier sucursal y cancela pedidos.
    - **Pendiente:** sin acceso.
 
 ## Qué se configura en Configuración
@@ -96,7 +96,7 @@ Contra un Supabase **local** (requiere Docker):
 ```bash
 pnpm exec supabase start
 pnpm exec supabase db reset    # aplica supabase/migrations
-pnpm db:test                   # aislamiento entre negocios, folios por negocio, roles y logotipos
+pnpm db:test                   # aislamiento entre negocios, folios, roles, membresías y logotipos (borra lo que crea)
 ```
 
 Prueba de humo en Chromium (con `pnpm dev` corriendo y `.env.local` apuntando a un Supabase de pruebas; da de alta un negocio nuevo y recorre las rutas; usa `/usr/bin/chromium`, cambia la ruta con `CHROMIUM=`):
