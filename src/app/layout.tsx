@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { headers } from "next/headers";
 import { Geist_Mono, Manrope, Syne } from "next/font/google";
 import { ThemeProvider } from "next-themes";
 import { AppShell } from "@/components/app-shell";
@@ -28,7 +29,9 @@ export const metadata: Metadata = {
   description: "Panel de control de ventas, inventario y finanzas para boutiques y tiendas de ropa.",
 };
 
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default async function RootLayout({ children }: LayoutProps<"/">) {
+  // Leer la cabecera vuelve dinámicas las páginas: la CSP con nonce no funciona en páginas estáticas.
+  const nonce = (await headers()).get("x-nonce") ?? undefined;
   return (
     <html
       lang="es"
@@ -36,7 +39,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       className={`${sans.variable} ${geistMono.variable} ${display.variable} h-full antialiased`}
     >
       <body className="min-h-full">
-        <ThemeProvider attribute="class" defaultTheme="dark" enableSystem={false} disableTransitionOnChange>
+        <ThemeProvider nonce={nonce} attribute="class" defaultTheme="dark" enableSystem={false} disableTransitionOnChange>
           <TooltipProvider delayDuration={200}>
             <AppShell>{children}</AppShell>
             <Toaster richColors position="top-right" />

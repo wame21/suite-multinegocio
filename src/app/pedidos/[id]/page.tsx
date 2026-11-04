@@ -36,7 +36,7 @@ import { onlyDigits } from "@/lib/clabe";
 import { CUSTOMER_TYPE_LABEL, PAYMENT_LABEL, STATUS_LABEL } from "@/lib/constants";
 import { fDateTime, mxn, pct } from "@/lib/format";
 import { orderBalance, orderCost, orderFees, orderPaid } from "@/lib/metrics";
-import { errorMessage, useBranchName, useBusinessName, useErp, useIsOwner } from "@/lib/store";
+import { errorMessage, useBranchName, useBusinessName, useCanCancelOrders, useErp, useIsOwner } from "@/lib/store";
 import type { Order, OrderStatus, PaymentMethod } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { TIERS } from "@/lib/wholesale";
@@ -297,6 +297,7 @@ export default function PedidoDetalle() {
 
 function OrderActions({ order, balance, pickup }: { order: Order; balance: number; pickup: boolean }) {
   const setOrderStatus = useErp((s) => s.setOrderStatus);
+  const canCancel = useCanCancelOrders();
   if (order.status === "cancelado" || order.status === "entregado") return null;
   return (
     <div className="flex flex-wrap gap-2">
@@ -314,7 +315,7 @@ function OrderActions({ order, balance, pickup }: { order: Order; balance: numbe
           <PackageCheck /> Marcar entregado
         </Button>
       )}
-      <CancelDialog order={order} />
+      {canCancel && <CancelDialog order={order} />}
     </div>
   );
 }

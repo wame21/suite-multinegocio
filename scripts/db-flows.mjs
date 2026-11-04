@@ -1,12 +1,8 @@
 // Flujos de operación contra el Supabase LOCAL (pnpm exec supabase start).
-// Uso: pnpm exec supabase db reset && pnpm db:flows
+// Uso: pnpm db:flows   (borra al terminar los usuarios y negocios @example.test que crea)
 // Complementa a db-test.mjs: triggers de existencia, folios, ventas, pagos, cancelaciones, kardex,
 // traspasos, conteos, cotizaciones, administración del negocio, logotipos y usuarios pendientes.
-import { createClient } from "@supabase/supabase-js";
-import { SERVICE_KEY, URL, check, expectDenied, expectError, inviteLookup, mail, newClient, report, signUp, user } from "./db-helpers.mjs";
-
-// Solo para preparar casos que ningún rol puede crear (p. ej. borrar una fila de existencia). Es el stack local.
-const admin = createClient(URL, SERVICE_KEY, { auth: { persistSession: false } });
+import { check, expectDenied, expectError, fakeIp, inviteLookup, mail, newClient, report, service as admin, signUp, user } from "./db-helpers.mjs";
 
 const stockQty = async (db, vk, branch) =>
   (await db.from("stock").select("qty").eq("variant_key", vk).eq("branch", branch).maybeSingle()).data?.qty;
@@ -48,16 +44,19 @@ async function main() {
   // -------------------------------------------------------------------------
   // Alta de los dos negocios, el vendedor y el usuario pendiente
   // -------------------------------------------------------------------------
-  const anon = newClient(`flows-${Date.now()}`);
+  const anon = newClient(fakeIp());
   const ownerA = await user(mail("flujo-dueno-a"), { name: "Dueña Alfa", business_name: "Flujos Alfa" });
   const ownerB = await user(mail("flujo-dueno-b"), { name: "Dueño Beta", business_name: "Flujos Beta" });
   const { data: bizA } = await ownerA.db.from("businesses").select("*").single();
   const { data: bizB } = await ownerB.db.from("businesses").select("*").single();
   const seller = await user(mail("flujo-karla"), { name: "Karla", invite_code: bizA.invite_code });
   const pending = await user(mail("flujo-pendiente"), { name: "Pendiente", invite_code: bizA.invite_code });
+  const encargado = await user(mail("flujo-eli"), { name: "Eli", invite_code: bizA.invite_code });
+  const NO_STOCK = /Solo el dueño o el encargado mueven inventario/;
+  const NO_CANCEL = /Solo el dueño o el encargado cancelan pedidos/;
   const { data: [principalA] } = await ownerA.db.from("branches").select("*");
   const { data: [principalB] } = await ownerB.db.from("branches").select("*");
-  check("preparación: dos negocios, un vendedor y un pendiente", !!bizA && !!bizB && !!principalA && !!principalB && bizA.id !== bizB.id);
+  check("preparación: dos negocios, un vendedor, un encargado y un pendiente", !!bizA && !!bizB && !!principalA && !!principalB && bizA.id !== bizB.id);
 
   // -------------------------------------------------------------------------
   // Triggers de existencia: producto con variantes y sucursal nueva
@@ -67,6 +66,8 @@ async function main() {
 
   const { error: approveErr } = await ownerA.db.rpc("set_member", { p_id: seller.id, p_role: "vendedor", p_branch: centro.id });
   check("dueño aprueba al vendedor en la sucursal Centro", !approveErr, approveErr?.message);
+  const { error: encApproveErr } = await ownerA.db.rpc("set_member", { p_id: encargado.id, p_role: "encargado", p_branch: centro.id });
+  check("dueño aprueba al encargado en la sucursal Centro", !encApproveErr, encApproveErr?.message);
 
   const { data: pA, error: pAErr } = await ownerA.db
     .from("products")
@@ -125,10 +126,14 @@ async function main() {
   check("una entrada en 0 no deja rastro en el kardex", (await kardex(ownerA.db, { variant_key: variantKey(pA, "Blanco", "M") })).length === 0);
   await expectError("tipo de movimiento inválido", ownerA.db.rpc("move_stock", { p_entries: [{ variantKey: vkNM, qty: 1 }], p_branch: principalA.id, p_type: "venta" }), /Tipo de movimiento inválido/);
   await expectError("variante inexistente en la sucursal", ownerA.db.rpc("move_stock", { p_entries: [{ variantKey: `${pA.id}|Verde|M`, qty: 1 }], p_branch: principalA.id, p_type: "entrada" }), /Variante inexistente/);
-  await expectError("el vendedor no registra entradas", seller.db.rpc("move_stock", { p_entries: [{ variantKey: vkNM, qty: 5 }], p_branch: centro.id, p_type: "entrada" }), /dueño/);
-
-  const { error: adjErr } = await seller.db.rpc("move_stock", { p_entries: [{ variantKey: vkNM, qty: -9 }], p_branch: centro.id, p_type: "ajuste", p_note: "Merma" });
-  check("el vendedor registra un ajuste", !adjErr, adjErr?.message);
+  await expectError("el vendedor no registra entradas", seller.db.rpc("move_stock", { p_entries: [{ variantKey: vkNM, qty: 5 }], p_branch: centro.id, p_type: "entrada" }), NO_STOCK);
+  await expectError("el vendedor no registra ajustes", seller.db.rpc("move_stock", { p_entries: [{ variantKey: vkNM, qty: -9 }], p_branch: centro.id, p_type: "ajuste", p_note: "Merma" }), NO_STOCK);
+  check("el movimiento rechazado no toca la existencia", (await stockQty(ownerA.db, vkNM, centro.id)) === 5);
+  const { error: encInErr } = await encargado.db.rpc("move_stock", { p_entries: [{ variantKey: vkNS, qty: 2 }], p_branch: principalA.id, p_type: "entrada", p_note: "Entrada del encargado" });
+  check("el encargado registra una entrada en cualquier sucursal", !encInErr && (await stockQty(ownerA.db, vkNS, principalA.id)) === 12, encInErr?.message);
+  await encargado.db.rpc("move_stock", { p_entries: [{ variantKey: vkNS, qty: -2 }], p_branch: principalA.id, p_type: "ajuste" });
+  const { error: adjErr } = await encargado.db.rpc("move_stock", { p_entries: [{ variantKey: vkNM, qty: -9 }], p_branch: centro.id, p_type: "ajuste", p_note: "Merma" });
+  check("el encargado registra un ajuste", !adjErr, adjErr?.message);
   check("un ajuste mayor a la existencia la deja en 0", (await stockQty(ownerA.db, vkNM, centro.id)) === 0);
   const [adjMov] = await kardex(ownerA.db, { type: "ajuste", variant_key: vkNM, branch: centro.id });
   check("el kardex anota solo lo que realmente se descontó (−5)", adjMov?.qty === -5 && adjMov.note === "Merma", `qty=${adjMov?.qty}`);
@@ -199,8 +204,9 @@ async function main() {
   await expectError("pago en 0", seller.db.rpc("add_payment", { p_order: o2.id, p_payment: { amount: 0, method: "efectivo" } }), /Monto inválido/);
   await expectError("pago negativo", seller.db.rpc("add_payment", { p_order: o2.id, p_payment: { amount: -5, method: "efectivo" } }), /Monto inválido/);
   await expectError("pago a un pedido que no existe", seller.db.rpc("add_payment", { p_order: "no-existe", p_payment: { amount: 5, method: "efectivo" } }), /Pedido no encontrado/);
-  const { data: p1 } = await seller.db.rpc("add_payment", { p_order: o2.id, p_payment: { amount: 100, method: "efectivo" } });
+  const { data: p1 } = await seller.db.rpc("add_payment", { p_order: o2.id, p_payment: { amount: 100, method: "efectivo", note: "anticipo", id: "falso", hack: true } });
   check("primer pago a un pedido pendiente lo deja apartado", p1?.status === "apartado" && p1.payments.length === 1, p1?.status);
+  check("add_payment guarda solo method, amount y note (id y fecha del servidor)", JSON.stringify(Object.keys(p1?.payments?.[0] ?? {}).sort()) === JSON.stringify(["amount", "date", "id", "method", "note"]) && p1.payments[0].id !== "falso", JSON.stringify(p1?.payments?.[0]));
   const { data: p2 } = await seller.db.rpc("add_payment", { p_order: o2.id, p_payment: { amount: 499, method: "tarjeta" } });
   check("liquidar el saldo lo deja pagado", p2?.status === "pagado" && p2.payments.length === 2, `${p2?.status} ${p2?.payments?.length}`);
   await expectError("pago mayor al saldo pendiente", seller.db.rpc("add_payment", { p_order: o3.id, p_payment: { amount: 500, method: "efectivo" } }), /El pago excede el saldo pendiente/);
@@ -218,24 +224,28 @@ async function main() {
   await expectError("estado inválido", seller.db.rpc("set_order_status", { p_order: o2.id, p_status: "perdido" }));
   await expectError("pedido inexistente", seller.db.rpc("set_order_status", { p_order: "no-existe", p_status: "enviado" }), /Pedido no encontrado/);
 
-  const { data: cancelled, error: cancelErr } = await seller.db.rpc("set_order_status", { p_order: o1.id, p_status: "cancelado" });
-  check("cancelar un pedido pagado", !cancelErr && cancelled?.status === "cancelado", cancelErr?.message);
+  await expectError("el vendedor no cancela pedidos", seller.db.rpc("set_order_status", { p_order: o1.id, p_status: "cancelado" }), NO_CANCEL);
+  check("la cancelación rechazada deja el pedido y la existencia intactos", (await ownerA.db.from("orders").select("status").eq("id", o1.id).single()).data?.status === "pagado" && (await stockQty(ownerA.db, vkNM, centro.id)) === 2);
+  const { data: cancelled, error: cancelErr } = await encargado.db.rpc("set_order_status", { p_order: o1.id, p_status: "cancelado" });
+  check("el encargado cancela un pedido pagado", !cancelErr && cancelled?.status === "cancelado", cancelErr?.message);
   check("cancelar regresa las piezas a la sucursal que surtió", (await stockQty(ownerA.db, vkNM, centro.id)) === 4);
   const [cancelMov] = await kardex(ownerA.db, { type: "cancelacion", ref: o1.folio });
   check("el kardex anota la cancelación con cantidad positiva", cancelMov?.qty === 2 && cancelMov.branch === centro.id && /cancelación/.test(cancelMov.note ?? ""), cancelMov?.note);
-  await expectError("no se cancela dos veces", seller.db.rpc("set_order_status", { p_order: o1.id, p_status: "cancelado" }), /ya está cancelado/);
+  await expectError("no se cancela dos veces", encargado.db.rpc("set_order_status", { p_order: o1.id, p_status: "cancelado" }), /ya está cancelado/);
   await expectError("un pedido cancelado no cambia de estado", seller.db.rpc("set_order_status", { p_order: o1.id, p_status: "entregado" }), /ya está cancelado/);
   await expectError("un pedido cancelado no recibe pagos", seller.db.rpc("add_payment", { p_order: o1.id, p_payment: { amount: 10, method: "efectivo" } }), /Pedido no encontrado o cancelado/);
   check("las cancelaciones repetidas no duplican las piezas", (await stockQty(ownerA.db, vkNM, centro.id)) === 4);
   const { data: o3c } = await ownerA.db.rpc("set_order_status", { p_order: o3.id, p_status: "cancelado" });
-  check("cancelar un pedido en línea regresa a la sucursal que lo surtió", o3c?.status === "cancelado" && (await stockQty(ownerA.db, vkNM, principalA.id)) === 30);
+  check("el dueño cancela un pedido en línea y regresa a la sucursal que lo surtió", o3c?.status === "cancelado" && (await stockQty(ownerA.db, vkNM, principalA.id)) === 30);
 
   // -------------------------------------------------------------------------
   // transfer_stock y set_stock_count
   // -------------------------------------------------------------------------
   const principalBefore = await stockQty(ownerA.db, vkNM, principalA.id);
-  const { error: trErr } = await seller.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkNM, qty: 4 }, { variantKey: vkNS, qty: 0 }], p_from: principalA.id, p_to: norte.id });
-  check("traspaso entre sucursales", !trErr, trErr?.message);
+  await expectError("el vendedor no traspasa", seller.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkNM, qty: 4 }], p_from: principalA.id, p_to: norte.id }), NO_STOCK);
+  check("el traspaso rechazado no mueve existencia", (await stockQty(ownerA.db, vkNM, principalA.id)) === principalBefore);
+  const { error: trErr } = await encargado.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkNM, qty: 4 }, { variantKey: vkNS, qty: 0 }], p_from: principalA.id, p_to: norte.id });
+  check("el encargado traspasa entre sucursales", !trErr, trErr?.message);
   check("el traspaso resta al origen y suma al destino", (await stockQty(ownerA.db, vkNM, principalA.id)) === principalBefore - 4 && (await stockQty(ownerA.db, vkNM, norte.id)) === 4);
   const trMovs = await kardex(ownerA.db, { type: "traspaso", variant_key: vkNM });
   const trOut = trMovs.find((m) => m.branch === principalA.id);
@@ -244,40 +254,44 @@ async function main() {
   check("el kardex anota «Desde <sucursal>» en el destino", trIn?.qty === 4 && trIn.note === `Desde ${principalA.name}`, trIn?.note);
   check("las dos puntas del traspaso comparten referencia TR-", !!trOut?.ref && trOut.ref === trIn?.ref && trOut.ref.startsWith("TR-"), trOut?.ref);
   check("una cantidad en 0 no genera traspaso", (await kardex(ownerA.db, { type: "traspaso", variant_key: vkNS })).length === 0);
-  await expectError("traspaso a la misma sucursal", seller.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkNM, qty: 1 }], p_from: norte.id, p_to: norte.id }), /ubicaciones distintas/);
-  await expectError("traspaso sin existencia suficiente", seller.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkNM, qty: 500 }], p_from: principalA.id, p_to: norte.id }), /Sin existencia suficiente para traspasar/);
-  await expectError("traspaso desde una sucursal inexistente", seller.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkNM, qty: 1 }], p_from: "no-existe", p_to: norte.id }), /Sucursal inválida/);
+  await expectError("traspaso a la misma sucursal", encargado.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkNM, qty: 1 }], p_from: norte.id, p_to: norte.id }), /ubicaciones distintas/);
+  await expectError("traspaso sin existencia suficiente", encargado.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkNM, qty: 500 }], p_from: principalA.id, p_to: norte.id }), /Sin existencia suficiente para traspasar/);
+  await expectError("traspaso desde una sucursal inexistente", encargado.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkNM, qty: 1 }], p_from: "no-existe", p_to: norte.id }), /Sucursal inválida/);
 
   // Una variante que existe en el origen pero no en el destino (se quita la fila con la llave de servicio)
   await admin.from("stock").delete().eq("variant_key", vkNL).eq("branch", norte.id);
   await ownerA.db.rpc("move_stock", { p_entries: [{ variantKey: vkNL, qty: 3 }], p_branch: principalA.id, p_type: "entrada" });
-  await expectError("traspaso a un destino sin la variante", seller.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkNL, qty: 1 }], p_from: principalA.id, p_to: norte.id }), /Variante inexistente en el destino/);
+  await expectError("traspaso a un destino sin la variante", encargado.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkNL, qty: 1 }], p_from: principalA.id, p_to: norte.id }), /Variante inexistente en el destino/);
   check("el traspaso fallido no descuenta el origen", (await stockQty(ownerA.db, vkNL, principalA.id)) === 3);
   await admin.from("stock").insert({ variant_key: vkNL, business_id: bizA.id, product_id: pA.id, branch: norte.id, qty: 0 });
 
-  const { data: changed, error: cntErr } = await seller.db.rpc("set_stock_count", { p_branch: norte.id, p_entries: [{ variantKey: vkNM, qty: 10 }, { variantKey: vkNS, qty: 0 }] });
-  check("el conteo físico fija la existencia y cuenta solo lo que cambió", !cntErr && changed === 1, cntErr?.message ?? `changed=${changed}`);
+  await expectError("el vendedor no cuenta el inventario", seller.db.rpc("set_stock_count", { p_branch: norte.id, p_entries: [{ variantKey: vkNM, qty: 10 }] }), NO_STOCK);
+  const { data: changed, error: cntErr } = await encargado.db.rpc("set_stock_count", { p_branch: norte.id, p_entries: [{ variantKey: vkNM, qty: 10 }, { variantKey: vkNS, qty: 0 }] });
+  check("el conteo del encargado fija la existencia y cuenta solo lo que cambió", !cntErr && changed === 1, cntErr?.message ?? `changed=${changed}`);
   check("la existencia queda en lo contado", (await stockQty(ownerA.db, vkNM, norte.id)) === 10);
   const countMovs = await kardex(ownerA.db, { type: "ajuste", branch: norte.id });
   check("el kardex anota la diferencia del conteo (+6)", countMovs.length === 1 && countMovs[0].qty === 6 && countMovs[0].note === "Conteo físico", countMovs.map((m) => `${m.qty}`).join(","));
-  const { data: changedAgain } = await seller.db.rpc("set_stock_count", { p_branch: norte.id, p_entries: [{ variantKey: vkNM, qty: 10 }] });
-  check("contar lo mismo no cambia nada ni deja rastro", changedAgain === 0 && (await kardex(ownerA.db, { type: "ajuste", branch: norte.id })).length === 1);
-  await expectError("el conteo no admite negativos", seller.db.rpc("set_stock_count", { p_branch: norte.id, p_entries: [{ variantKey: vkNM, qty: -1 }] }), /no puede ser negativa/);
-  await expectError("el conteo rechaza variantes inexistentes", seller.db.rpc("set_stock_count", { p_branch: norte.id, p_entries: [{ variantKey: `${pA.id}|Verde|M`, qty: 1 }] }), /Variante inexistente/);
+  const { data: changedAgain } = await ownerA.db.rpc("set_stock_count", { p_branch: norte.id, p_entries: [{ variantKey: vkNM, qty: 10 }] });
+  check("el dueño cuenta lo mismo: no cambia nada ni deja rastro", changedAgain === 0 && (await kardex(ownerA.db, { type: "ajuste", branch: norte.id })).length === 1);
+  await expectError("el conteo no admite negativos", encargado.db.rpc("set_stock_count", { p_branch: norte.id, p_entries: [{ variantKey: vkNM, qty: -1 }] }), /no puede ser negativa/);
+  await expectError("el conteo rechaza variantes inexistentes", encargado.db.rpc("set_stock_count", { p_branch: norte.id, p_entries: [{ variantKey: `${pA.id}|Verde|M`, qty: 1 }] }), /Variante inexistente/);
 
   // -------------------------------------------------------------------------
   // Cotizaciones: folios, edición y conversión
   // -------------------------------------------------------------------------
+  // create_order lee el nivel de settings: 20 % → round(599 × 0.8 / 5) × 5 = 480, el mínimo que un vendedor puede cobrar con ese nivel
+  const { data: wsA } = await ownerA.db.from("settings").select("value").eq("key", "wholesale").single();
+  await ownerA.db.from("settings").update({ value: { ...wsA.value, tiers: [...wsA.value.tiers, { id: "mayoreo", name: "Mayoreo", minPieces: 6, discount: 0.2, description: "" }] } }).eq("key", "wholesale");
   const quoteOf = (customer, product, vk, qty, extra = {}) => ({
     customerId: customer.id,
     customerName: customer.business,
-    items: [{ ...item(product, vk, qty), unitPrice: 469 }],
-    tierId: "lista",
+    items: [{ ...item(product, vk, qty), unitPrice: 480 }],
+    tierId: "mayoreo",
     subtotalList: 599 * qty,
-    discount: 130 * qty,
-    subtotal: 469 * qty,
+    discount: 119 * qty,
+    subtotal: 480 * qty,
     shipping: 280,
-    total: 469 * qty + 280,
+    total: 480 * qty + 280,
     depositPct: 0.5,
     status: "enviada",
     validUntil: new Date(Date.now() + 7 * 864e5).toISOString(),
@@ -285,14 +299,30 @@ async function main() {
   });
   const { data: q1, error: q1Err } = await seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkNM, 6) });
   check("primera cotización = COT-0001", !q1Err && q1?.folio === "COT-0001", q1Err?.message ?? q1?.folio);
-  const { data: q2 } = await seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkNM, 3) });
+  // 6 piezas: es el mínimo del nivel mayoreo para quien no es dueño.
+  const { data: q2 } = await seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkNM, 6) });
   check("segunda cotización = COT-0002", q2?.folio === "COT-0002", q2?.folio);
-  const { data: q1Edit } = await seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkNM, 6, { id: q1.id, notes: "Editada", status: "aceptada" }) });
-  check("editar una cotización conserva id y folio", q1Edit?.id === q1.id && q1Edit.folio === "COT-0001" && q1Edit.notes === "Editada" && q1Edit.status === "aceptada", q1Edit?.folio);
+  const { data: q1Edit } = await seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkNM, 6, { id: q1.id, notes: "Editada", status: "borrador" }) });
+  check("editar una cotización conserva id y folio", q1Edit?.id === q1.id && q1Edit.folio === "COT-0001" && q1Edit.notes === "Editada" && q1Edit.status === "borrador", q1Edit?.folio);
+  await expectDenied("la cotización no se actualiza con UPDATE directo", seller.db.from("quotes").update({ status: "aceptada" }).eq("id", q1.id).select());
+  const { data: q1Acc, error: q1AccErr } = await seller.db.rpc("set_quote_status", { p_id: q1.id, p_status: "aceptada" });
+  check("el estado de la cotización cambia con set_quote_status", !q1AccErr && q1Acc?.status === "aceptada" && q1Acc.folio === "COT-0001", q1AccErr?.message);
+  await expectError("set_quote_status: cotización de otro negocio", ownerB.db.rpc("set_quote_status", { p_id: q1.id, p_status: "rechazada" }), /Cotización no encontrada/);
+  await expectError("set_quote_status nunca va hacia convertida", seller.db.rpc("set_quote_status", { p_id: q1.id, p_status: "convertida" }), /La cotización ya es un pedido/);
+  await expectError("set_quote_status rechaza un estado inexistente", seller.db.rpc("set_quote_status", { p_id: q1.id, p_status: "perdida" }), /Estado de cotización inválido/);
+  await expectError("save_quote solo admite borrador o enviada", seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkNM, 6, { id: q1.id, status: "aceptada" }) }), /Estado de cotización inválido/);
   const { data: q3 } = await seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkNM, 500) });
+  check("save_quote recalcula los totales en el servidor", q3?.subtotal_list === 599 * 500 && q3.subtotal === 480 * 500 && q3.discount === 119 * 500 && q3.total === 480 * 500 + 280, `${q3?.subtotal}/${q3?.total}`);
   check("editar no gasta folio: la siguiente es COT-0003", q3?.folio === "COT-0003", q3?.folio);
   const { data: quotesA } = await ownerA.db.from("quotes").select("id");
   check("editar no duplica cotizaciones", quotesA?.length === 3, `${quotesA?.length} cotizaciones`);
+  await expectError("el vendedor no cotiza debajo del piso de su nivel", seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkNM, 6, { items: [{ ...item(pA, vkNM, 6), unitPrice: 479 }] }) }), /Precio menor al de catálogo/);
+  await expectError("el vendedor no cotiza un nivel sin alcanzar sus piezas mínimas", seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkNM, 5) }), /no alcanza las piezas mínimas/);
+  await expectError("save_quote rechaza renglones repetidos", seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkNM, 6, { items: [item(pA, vkNM, 3, 480), item(pA, vkNM, 3, 480)] }) }), /Producto repetido/);
+  await expectError("save_quote rechaza más de 200 renglones", ownerA.db.rpc("save_quote", { p: quoteOf(custA, pA, vkNM, 6, { items: Array.from({ length: 201 }, (_, i) => item(pA, `${vkNM}${i}`, 1, 480)) }) }), /hasta 200 renglones/);
+  await expectError("save_quote rechaza cantidades no enteras", ownerA.db.rpc("save_quote", { p: quoteOf(custA, pA, vkNM, 6, { items: [item(pA, vkNM, 1.5, 480)] }) }), /Cantidad inválida/);
+  await expectError("save_quote rechaza un anticipo fuera de 0..1", ownerA.db.rpc("save_quote", { p: quoteOf(custA, pA, vkNM, 6, { depositPct: 1.5 }) }), /Anticipo inválido/);
+  await expectError("save_quote rechaza un envío NaN", ownerA.db.rpc("save_quote", { p: quoteOf(custA, pA, vkNM, 6, { shipping: "NaN" }) }), /Envío inválido/);
   await expectError("cotizar a un cliente de otro negocio", ownerB.db.rpc("save_quote", { p: quoteOf(custA, pB, vkB, 1) }), /Cliente inválido/);
   const { data: custB } = await ownerB.db.from("customers").insert({ name: "Cliente Beta", business: "Tienda Beta", phone: "555 111 1111", type: "mayorista" }).select().single();
   const { data: qB } = await ownerB.db.rpc("save_quote", { p: quoteOf(custB, pB, vkB, 1) });
@@ -318,6 +348,7 @@ async function main() {
   const { data: q1After } = await ownerA.db.from("quotes").select("status, order_id").eq("id", q1.id).single();
   check("la cotización queda convertida y ligada al pedido", q1After?.status === "convertida" && q1After.order_id === conv?.id);
   await expectError("una cotización convertida no se convierte otra vez", seller.db.rpc("convert_quote", { p_quote: q1.id, p_deposit: {} }), /ya es un pedido/);
+  await expectError("una cotización convertida no cambia de estado", seller.db.rpc("set_quote_status", { p_id: q1.id, p_status: "borrador" }), /La cotización ya es un pedido/);
 
   // Cambiar la sucursal que surte mayoreo cambia de dónde se aparta
   await ownerA.db.from("branches").update({ is_warehouse: false }).eq("id", principalA.id);
@@ -325,7 +356,7 @@ async function main() {
   const { data: conv2, error: conv2Err } = await seller.db.rpc("convert_quote", { p_quote: q2.id, p_deposit: {} });
   check("sin anticipo el pedido de mayoreo queda pendiente", !conv2Err && conv2?.status === "pendiente" && conv2.payments.length === 0, conv2Err?.message ?? conv2?.status);
   check("el pedido de mayoreo siguiente toma el folio que sigue", conv2?.folio === folioA(), conv2?.folio);
-  check("la nueva bodega surte el pedido", conv2?.branch === norte.id && (await stockQty(ownerA.db, vkNM, norte.id)) === 7, `branch=${conv2?.branch}`);
+  check("la nueva bodega surte el pedido", conv2?.branch === norte.id && (await stockQty(ownerA.db, vkNM, norte.id)) === 4, `branch=${conv2?.branch}`);
   await ownerA.db.from("branches").update({ is_warehouse: false }).eq("id", norte.id);
   await ownerA.db.from("branches").update({ is_warehouse: true }).eq("id", principalA.id);
 
@@ -345,6 +376,11 @@ async function main() {
   await expectError("update_business: prefijo de solo espacios", ownerA.db.rpc("update_business", { p_name: "Flujos Alfa", p_order_prefix: "   ", p_quote_prefix: "COT-" }), /vacíos/);
   await expectError("update_business: prefijo de pedido de más de 10 caracteres", ownerA.db.rpc("update_business", { p_name: "Flujos Alfa", p_order_prefix: "ABCDEFGHIJK", p_quote_prefix: "COT-" }), /10 caracteres/);
   await expectError("update_business: prefijo de cotización de más de 10 caracteres", ownerA.db.rpc("update_business", { p_name: "Flujos Alfa", p_order_prefix: "V-", p_quote_prefix: "ABCDEFGHIJK" }), /10 caracteres/);
+  await expectError("update_business: prefijo de pedido que termina en dígito", ownerA.db.rpc("update_business", { p_name: "Flujos Alfa", p_order_prefix: "V-1", p_quote_prefix: "COT-" }), /terminar en letra o guion/);
+  await expectError("update_business: prefijo de cotización que termina en dígito", ownerA.db.rpc("update_business", { p_name: "Flujos Alfa", p_order_prefix: "V-", p_quote_prefix: "COT1" }), /terminar en letra o guion/);
+  await expectError("update_business: prefijo con espacio", ownerA.db.rpc("update_business", { p_name: "Flujos Alfa", p_order_prefix: "V X-", p_quote_prefix: "COT-" }), /solo admiten letras, números y guion/);
+  await expectError("update_business: prefijo con símbolo", ownerA.db.rpc("update_business", { p_name: "Flujos Alfa", p_order_prefix: "V$", p_quote_prefix: "COT-" }), /solo admiten letras, números y guion/);
+  await expectError("update_business: el encargado no puede", encargado.db.rpc("update_business", { p_name: "Otro", p_order_prefix: "X-", p_quote_prefix: "Y-" }), /Solo el dueño/);
   await expectError("update_business: el vendedor no puede", seller.db.rpc("update_business", { p_name: "Otro", p_order_prefix: "X-", p_quote_prefix: "Y-" }), /Solo el dueño/);
   await expectError("update_business: el pendiente no puede", pending.db.rpc("update_business", { p_name: "Otro", p_order_prefix: "X-", p_quote_prefix: "Y-" }), /No autorizado/);
   const { data: bizUnchanged } = await ownerA.db.from("businesses").select("name, order_prefix, quote_prefix").single();
@@ -385,7 +421,9 @@ async function main() {
   await expectError("set_member: no hay un segundo dueño", ownerA.db.rpc("set_member", { p_id: seller.id, p_role: "dueno", p_branch: null }), /Solo puede haber un dueño/);
   await expectError("set_member: el dueño no cambia su propio rol", ownerA.db.rpc("set_member", { p_id: ownerA.id, p_role: "vendedor", p_branch: null }), /propio rol/);
   await expectError("set_member: no alcanza a miembros de otro negocio", ownerB.db.rpc("set_member", { p_id: seller.id, p_role: "pendiente", p_branch: null }), /Colaborador no encontrado/);
-  const { data: sellerStill } = await ownerA.db.from("profiles").select("role, branch").eq("id", seller.id).single();
+  await expectError("set_member: el encargado no puede", encargado.db.rpc("set_member", { p_id: pending.id, p_role: "vendedor", p_branch: centro.id }), /Solo el dueño/);
+  await expectError("set_member: el puesto de otro giro no existe en boutique", ownerA.db.rpc("set_member", { p_id: pending.id, p_role: "cocina", p_branch: null }), /Ese puesto no existe en este giro/);
+  const { data: sellerStill } = await ownerA.db.from("business_members").select("role, branch").eq("user_id", seller.id).single();
   check("los intentos rechazados no cambian al vendedor", sellerStill?.role === "vendedor" && sellerStill.branch === centro.id);
 
   const { data: noBranch } = await ownerA.db.rpc("set_member", { p_id: seller.id, p_role: "vendedor", p_branch: null });
@@ -402,17 +440,21 @@ async function main() {
   // -------------------------------------------------------------------------
   // Usuario pendiente: sin datos del negocio y sin operaciones
   // -------------------------------------------------------------------------
-  const { data: pendingProfile } = await pending.db.from("profiles").select("role, business_id");
-  check("el pendiente solo lee su propio perfil", pendingProfile?.length === 1 && pendingProfile[0].role === "pendiente" && pendingProfile[0].business_id === bizA.id);
+  const { data: pendingProfile } = await pending.db.from("profiles").select("id, active_business_id");
+  const { data: pendingMem } = await pending.db.from("business_members").select("role, business_id");
+  check("el pendiente solo lee su propio perfil y su membresía", pendingProfile?.length === 1 && pendingProfile[0].id === pending.id && pendingMem?.length === 1 && pendingMem[0].role === "pendiente" && pendingMem[0].business_id === bizA.id);
   for (const table of ["businesses", "branches", "products", "stock", "movements", "customers", "orders", "quotes", "expenses", "settings"]) {
     const { data: rows, error } = await pending.db.from(table).select("*");
     check(`el pendiente no lee ${table}`, !error && rows.length === 0, error?.message ?? `${rows?.length} filas`);
   }
   await expectError("el pendiente no registra clientes", pending.db.from("customers").insert({ name: "X", phone: "1" }).select().single());
-  await expectDenied("el pendiente no se promueve a sí mismo", pending.db.from("profiles").update({ role: "dueno" }).eq("id", pending.id).select());
-  check("el rol del pendiente sigue igual", (await pending.db.from("profiles").select("role").eq("id", pending.id).single()).data?.role === "pendiente");
-  await expectDenied("el vendedor no se promueve a sí mismo", seller.db.from("profiles").update({ role: "dueno" }).eq("id", seller.id).select());
-  await expectDenied("el pendiente no cambia su negocio", pending.db.from("profiles").update({ business_id: bizB.id }).eq("id", pending.id).select());
+  await expectDenied("el pendiente no se promueve a sí mismo", pending.db.from("business_members").update({ role: "dueno" }).eq("user_id", pending.id).select());
+  check("el rol del pendiente sigue igual", (await pending.db.from("business_members").select("role").eq("user_id", pending.id).single()).data?.role === "pendiente");
+  await expectDenied("el vendedor no se promueve a sí mismo", seller.db.from("business_members").update({ role: "dueno" }).eq("user_id", seller.id).select());
+  await expectDenied("el encargado no se promueve a sí mismo", encargado.db.from("business_members").update({ role: "dueno" }).eq("user_id", encargado.id).select());
+  await expectDenied("el pendiente no cambia su negocio activo por la tabla", pending.db.from("profiles").update({ active_business_id: bizB.id }).eq("id", pending.id).select());
+  await expectError("el pendiente no entra a un negocio donde no es miembro", pending.db.rpc("set_active_business", { p_id: bizB.id }), /Negocio no encontrado/);
+  check("el negocio activo del pendiente sigue igual", (await pending.db.from("profiles").select("active_business_id").eq("id", pending.id).single()).data?.active_business_id === bizA.id);
   const pendingCalls = {
     create_order: { p: order(pA, vkNM, centro.id, 1) },
     add_payment: { p_order: o2.id, p_payment: { amount: 1, method: "efectivo" } },
@@ -422,6 +464,7 @@ async function main() {
     set_stock_count: { p_branch: centro.id, p_entries: [{ variantKey: vkNM, qty: 1 }] },
     save_quote: { p: quoteOf(custA, pA, vkNM, 1) },
     convert_quote: { p_quote: q3.id, p_deposit: {} },
+    set_quote_status: { p_id: q3.id, p_status: "aceptada" },
   };
   for (const [fn, args] of Object.entries(pendingCalls)) {
     await expectError(`el pendiente no ejecuta ${fn}`, pending.db.rpc(fn, args), /No autorizado/);
@@ -484,6 +527,7 @@ async function main() {
   await expectError("dueño de B no reemplaza el logotipo de A", upload(ownerB.db, logoPath, png, "image/png", true));
   await expectError("el vendedor no sube a la carpeta de su negocio", upload(seller.db, `${bizA.id}/vendedor.png`));
   await expectError("el vendedor no reemplaza el logotipo", upload(seller.db, logoPath, png, "image/png", true));
+  await expectError("el encargado no sube logotipos", upload(encargado.db, `${bizA.id}/encargado.png`));
   await expectError("el pendiente no sube logotipos", upload(pending.db, `${bizA.id}/pendiente.png`));
   await expectError("un usuario sin sesión no sube logotipos", upload(anon, `${bizA.id}/anonimo.png`));
   await expectError("el dueño no sube fuera de la carpeta de su negocio", upload(ownerA.db, "logo-suelto.png"));

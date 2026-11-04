@@ -17,9 +17,13 @@ export interface Branch {
   sort: number;
 }
 
+/** Giro del negocio: define su panel y sus roles. */
+export type BusinessKind = "boutique" | "restaurante";
+
 export interface Business {
   id: string;
   name: string;
+  kind: BusinessKind;
   inviteCode: string;
   orderPrefix: string;
   quotePrefix: string;
@@ -204,14 +208,16 @@ export interface Expense {
   method: PaymentMethod;
 }
 
-export type Role = "dueno" | "vendedor";
+/** Rol en un negocio: vendedor y encargado son de boutique; mesero, cajero y cocina, de restaurante. */
+export type Role = "dueno" | "vendedor" | "encargado" | "mesero" | "cajero" | "cocina";
 
-/** Rol guardado en `profiles`: quien se registra queda pendiente hasta que el dueño lo aprueba. */
+/** Rol guardado en `business_members`: quien se une con código queda pendiente hasta que el dueño lo aprueba. */
 export type AppRole = Role | "pendiente";
 
 export interface Profile {
   id: string;
-  businessId: string;
+  /** Negocio activo; `null` en una cuenta de dueño que aún no entra a ninguno. */
+  businessId: string | null;
   name: string;
   email?: string;
   role: AppRole;
@@ -233,6 +239,21 @@ export interface ErpData {
 
 /** `revision` y `rechazada`: negocio recién registrado que el administrador de la plataforma aún no acepta. */
 export type MembershipState = "revision" | "rechazada" | "prueba" | "activa" | "gracia" | "vencida" | "suspendida";
+
+/** Fila de `my_businesses()`: un negocio de la cuenta, con su estado de cobro. */
+export interface OwnerBusiness {
+  id: string;
+  name: string;
+  kind: BusinessKind;
+  role: AppRole;
+  state: MembershipState;
+  endsAt: string | null;
+  rejectionReason: string | null;
+  /** Solo donde la cuenta es dueña. */
+  monthSales: number | null;
+  active: boolean;
+  createdAt: string;
+}
 
 /** Datos para pagar la membresía; los edita el administrador de la plataforma. */
 export interface PaymentDetails {

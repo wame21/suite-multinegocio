@@ -10,12 +10,13 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { bankFromClabe, clabeError, onlyDigits } from "@/lib/clabe";
 import { fDate, fDateTime, mxn } from "@/lib/format";
 import { supabase } from "@/lib/supabase/client";
-import type { MembershipState } from "@/lib/types";
+import type { BusinessKind, MembershipState } from "@/lib/types";
 
 /** Fila de `admin_businesses()`. */
 export type AdminBusiness = {
   id: string;
   name: string;
+  kind: BusinessKind;
   owner_name: string | null;
   owner_email: string | null;
   state: MembershipState;

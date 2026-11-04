@@ -1,20 +1,30 @@
 // Pruebas de la base de datos contra el Supabase LOCAL (pnpm exec supabase start).
-// Uso: pnpm exec supabase db reset && pnpm db:test
-// Crea dos negocios y verifica el aislamiento entre ellos, los folios por negocio y las reglas de rol.
-import { check, expectDenied, expectError, inviteLookup, mail, newClient, platformAdmin, report, service, signUp, user } from "./db-helpers.mjs";
+// Uso: pnpm db:test   (borra al terminar los usuarios y negocios @example.test que crea)
+// Crea dos negocios y verifica el aislamiento entre ellos, los folios por negocio, las membresías y las reglas de rol.
+import { check, createBusiness, expectDenied, expectError, fakeIp, inviteLookup, mail, newClient, platformAdmin, report, service, signIn, signUp, user } from "./db-helpers.mjs";
 
 // ---------------------------------------------------------------------------
 // Alta de negocios y usuarios
 // ---------------------------------------------------------------------------
-const anon = newClient(`anon-${Date.now()}`);
+const anon = newClient(fakeIp());
 const { data: unknownCode } = await inviteLookup(anon, "ZZZZZZZZ");
 check("invite-lookup de un código inexistente = null", unknownCode === null);
 await expectError("anon ya no consulta códigos directo en la base", anon.rpc("invite_lookup", { p_code: "ZZZZZZZZ", p_key: "x" }));
 const { error: legacyErr } = await anon.rpc("owner_exists");
 check("owner_exists ya no existe", !!legacyErr);
 
+// Sin código el alta solo crea el perfil: el negocio se crea después con create_business.
 const noMeta = await signUp(mail("sin-datos"), { name: "Sin datos" });
-check("alta sin negocio ni código se rechaza", !!noMeta.error, noMeta.error?.message);
+check("alta sin negocio ni código solo crea el perfil", !noMeta.error && !!noMeta.id, noMeta.error?.message);
+await signIn(noMeta.client, mail("sin-datos"));
+const { data: noMetaProfile } = await noMeta.client.from("profiles").select("active_business_id").eq("id", noMeta.id).single();
+check("ese perfil no tiene negocio activo ni membresías", noMetaProfile?.active_business_id === null && (await noMeta.client.from("business_members").select("business_id")).data?.length === 0);
+check("my_businesses de un perfil nuevo viene vacío", ((await noMeta.client.rpc("my_businesses")).data ?? []).length === 0);
+await expectError("sin negocio activo no se vende", noMeta.client.rpc("create_order", { p: {} }), /No autorizado/);
+await expectError("create_business exige nombre", noMeta.client.rpc("create_business", { p_name: "  ", p_kind: "boutique" }), /Nombre inválido/);
+await expectError("create_business rechaza un giro desconocido", noMeta.client.rpc("create_business", { p_name: "X", p_kind: "taller" }), /Giro inválido/);
+await expectError("anon no crea negocios", anon.rpc("create_business", { p_name: "X", p_kind: "boutique" }), /permission denied/);
+await expectError("set_active_business rechaza un negocio ajeno", noMeta.client.rpc("set_active_business", { p_id: "00000000-0000-0000-0000-000000000000" }), /Negocio no encontrado/);
 const badCode = await signUp(mail("mal-codigo"), { name: "Mal código", invite_code: "ZZZZZZZZ" });
 check("alta con código inválido se rechaza", !!badCode.error, badCode.error?.message);
 
@@ -29,12 +39,16 @@ check("folios iniciales por defecto", bizA?.order_prefix === "V-" && bizA?.next_
 check("código de invitación de 8 caracteres [A-Z2-9]", /^[A-Z2-9]{8}$/.test(bizA?.invite_code ?? "") && /^[A-Z2-9]{8}$/.test(bizB?.invite_code ?? ""));
 check("códigos de invitación distintos", bizA?.invite_code !== bizB?.invite_code);
 
+const { data: memA } = await ownerA.db.from("business_members").select("*").eq("user_id", ownerA.id).single();
 const { data: profA } = await ownerA.db.from("profiles").select("*").eq("id", ownerA.id).single();
-check("quien crea el negocio es dueño", profA?.role === "dueno" && profA?.business_id === bizA.id);
+check("quien crea el negocio es dueño y su negocio activo", memA?.role === "dueno" && memA?.business_id === bizA.id && profA?.active_business_id === bizA.id);
+check("profiles ya no guarda rol, negocio ni sucursal", !("role" in profA) && !("business_id" in profA) && !("branch" in profA));
+const { data: listA } = await ownerA.db.rpc("my_businesses");
+check("my_businesses lista el negocio activo con el giro y el rol", listA?.length === 1 && listA[0].id === bizA.id && listA[0].kind === "boutique" && listA[0].role === "dueno" && listA[0].active === true, JSON.stringify(listA));
 
 const { data: branchesA } = await ownerA.db.from("branches").select("*");
 check("negocio nuevo trae una sucursal principal", branchesA?.length === 1 && branchesA[0].pos && branchesA[0].is_warehouse, `${branchesA?.length} sucursales`);
-check("el dueño queda asignado a la sucursal principal", profA?.branch === branchesA?.[0]?.id);
+check("el dueño queda asignado a la sucursal principal", memA?.branch === branchesA?.[0]?.id);
 const principalA = branchesA[0];
 const { data: branchesB } = await ownerB.db.from("branches").select("*");
 const principalB = branchesB[0];
@@ -48,8 +62,10 @@ check("invite-lookup devuelve el nombre sin distinguir mayúsculas", lookup === 
 // El vendedor entra con el código en minúsculas; el pendiente con el código tal cual.
 const seller = await user(mail("karla"), { name: "Karla", invite_code: bizA.invite_code.toLowerCase() });
 const pending = await user(mail("pendiente"), { name: "Pendiente", invite_code: bizA.invite_code });
-const { data: sellerProfile } = await seller.db.from("profiles").select("*").eq("id", seller.id).single();
-check("alta por invite_code queda pendiente en ese negocio", sellerProfile?.role === "pendiente" && sellerProfile?.business_id === bizA.id);
+const encargado = await user(mail("eli"), { name: "Eli", invite_code: bizA.invite_code });
+const { data: sellerMem } = await seller.db.from("business_members").select("*").eq("user_id", seller.id).single();
+const { data: sellerProfile } = await seller.db.from("profiles").select("active_business_id").eq("id", seller.id).single();
+check("alta por invite_code queda pendiente en ese negocio", sellerMem?.role === "pendiente" && sellerMem?.business_id === bizA.id && sellerProfile?.active_business_id === bizA.id);
 
 // ---------------------------------------------------------------------------
 // Pendiente: sin acceso hasta que el dueño apruebe
@@ -61,6 +77,8 @@ check("pendiente no lee el negocio", Array.isArray(pendingBiz) && pendingBiz.len
 const { data: pendingCfg } = await pending.db.from("settings").select("key");
 check("pendiente no lee la configuración", Array.isArray(pendingCfg) && pendingCfg.length === 0);
 await expectError("pendiente no puede vender", seller.db.rpc("create_order", { p: {} }), /No autorizado/);
+await expectDenied("pendiente no cambia su membresía", seller.db.from("business_members").update({ role: "dueno" }).eq("user_id", seller.id).select());
+await expectDenied("pendiente no se pasa a otro negocio activo por la tabla", pending.db.from("profiles").update({ active_business_id: bizB.id }).eq("id", pending.id).select());
 
 // ---------------------------------------------------------------------------
 // Equipo y sucursales (negocio A)
@@ -80,8 +98,13 @@ await expectError("no se puede nombrar a otro dueño", ownerA.db.rpc("set_member
 await expectError("set_member rechaza una sucursal de otro negocio", ownerA.db.rpc("set_member", { p_id: seller.id, p_role: "vendedor", p_branch: principalB.id }), /Sucursal inválida/);
 const { error: approveErr } = await ownerA.db.rpc("set_member", { p_id: seller.id, p_role: "vendedor", p_branch: centro.id });
 check("dueño aprueba vendedor en una sucursal", !approveErr, approveErr?.message);
-const { data: sellerAfter } = await seller.db.from("profiles").select("*").eq("id", seller.id).single();
+const { data: sellerAfter } = await seller.db.from("business_members").select("*").eq("user_id", seller.id).single();
 check("el vendedor queda con su rol y sucursal", sellerAfter?.role === "vendedor" && sellerAfter?.branch === centro.id);
+await expectError("el vendedor no se asciende por la tabla de membresías", seller.db.from("business_members").update({ role: "dueno" }).eq("user_id", seller.id).select());
+await expectError("encargado: el vendedor no asigna puestos", seller.db.rpc("set_member", { p_id: encargado.id, p_role: "encargado", p_branch: null }), /Solo el dueño/);
+await expectError("un puesto de restaurante no existe en boutique", ownerA.db.rpc("set_member", { p_id: encargado.id, p_role: "mesero", p_branch: null }), /Ese puesto no existe en este giro/);
+const { data: encMem, error: encErr } = await ownerA.db.rpc("set_member", { p_id: encargado.id, p_role: "encargado", p_branch: centro.id });
+check("dueño asigna el puesto de encargado en boutique", !encErr && encMem?.role === "encargado" && encMem.branch === centro.id, encErr?.message);
 
 // ---------------------------------------------------------------------------
 // Catálogo e inventario (negocio A)
@@ -104,7 +127,13 @@ await expectError("vendedor no puede dar de alta productos", seller.db.from("pro
 await expectDenied("vendedor no puede cambiar precios", seller.db.from("products").update({ price: 1 }).eq("id", pA.id).select());
 
 const vkA = `${pA.id}|Negro|M`;
-await expectError("vendedor no registra entradas", seller.db.rpc("move_stock", { p_entries: [{ variantKey: vkA, qty: 5 }], p_branch: centro.id, p_type: "entrada" }), /dueño/);
+const NO_STOCK = /Solo el dueño o el encargado mueven inventario/;
+await expectError("vendedor no registra entradas", seller.db.rpc("move_stock", { p_entries: [{ variantKey: vkA, qty: 5 }], p_branch: centro.id, p_type: "entrada" }), NO_STOCK);
+await expectError("vendedor no registra ajustes", seller.db.rpc("move_stock", { p_entries: [{ variantKey: vkA, qty: -1 }], p_branch: centro.id, p_type: "ajuste" }), NO_STOCK);
+const { error: encInErr } = await encargado.db.rpc("move_stock", { p_entries: [{ variantKey: vkA, qty: 1 }], p_branch: centro.id, p_type: "entrada", p_ref: "OC-0" });
+check("encargado registra entradas", !encInErr, encInErr?.message);
+const { error: encOutErr } = await encargado.db.rpc("move_stock", { p_entries: [{ variantKey: vkA, qty: -1 }], p_branch: centro.id, p_type: "ajuste" });
+check("encargado registra ajustes", !encOutErr, encOutErr?.message);
 const { error: inErr } = await ownerA.db.rpc("move_stock", { p_entries: [{ variantKey: vkA, qty: 3 }], p_branch: centro.id, p_type: "entrada", p_ref: "OC-1" });
 check("dueño registra entrada", !inErr, inErr?.message);
 
@@ -161,6 +190,9 @@ check("anticipo deja el pedido apartado", layaway?.status === "apartado", layawa
 check("el pedido ganador de la carrera no deja huecos en los folios", layaway?.folio === "V-1003", layaway?.folio);
 const { data: paid } = await seller.db.rpc("add_payment", { p_order: layaway.id, p_payment: { amount: 299, method: "transferencia" } });
 check("liquidar lo marca pagado", paid?.status === "pagado", paid?.status);
+await expectError("vendedor no cancela pedidos", seller.db.rpc("set_order_status", { p_order: layaway.id, p_status: "cancelado" }), /Solo el dueño o el encargado cancelan pedidos/);
+const { data: encCancel, error: encCancelErr } = await encargado.db.rpc("set_order_status", { p_order: layaway.id, p_status: "cancelado" });
+check("encargado cancela pedidos y regresa las piezas", !encCancelErr && encCancel?.status === "cancelado", encCancelErr?.message);
 
 // Clientes, cotización y conversión
 const { data: custA, error: custErr } = await seller.db
@@ -170,47 +202,79 @@ const { data: custA, error: custErr } = await seller.db
   .single();
 check("vendedor registra cliente", !custErr, custErr?.message);
 await ownerA.db.rpc("move_stock", { p_entries: [{ variantKey: vkA, qty: 20 }], p_branch: principalA.id, p_type: "entrada" });
-const quoteOf = (customer, product, vk) => ({
+// Nivel de mayoreo de A guardado en settings: 20 % de descuento → round(599 × 0.8 / 5) × 5 = 480 (create_order lo lee de ahí).
+const { data: wsA } = await ownerA.db.from("settings").select("value").eq("key", "wholesale").single();
+const { error: tierErr } = await ownerA.db.from("settings").update({ value: { ...wsA.value, tiers: [...wsA.value.tiers, { id: "mayoreo", name: "Mayoreo", minPieces: 6, discount: 0.2, description: "" }] } }).eq("key", "wholesale");
+check("dueño define un nivel de mayoreo en la configuración", !tierErr, tierErr?.message);
+// Totales falsos a propósito: save_quote los recalcula en el servidor.
+const quoteOf = (customer, product, vk, price = 469, tierId = "lista") => ({
   customerId: customer.id,
   customerName: customer.business,
-  items: [{ ...item(product, vk, 12), unitPrice: 469 }],
-  tierId: "lista",
+  items: [{ ...item(product, vk, 12), unitPrice: price }],
+  tierId,
   subtotalList: 7188,
-  discount: 1560,
-  subtotal: 5628,
+  discount: 7188 - 12 * price,
+  subtotal: 12 * price,
   shipping: 280,
-  total: 5908,
+  total: 12 * price + 280,
   depositPct: 0.5,
   status: "enviada",
   validUntil: new Date(Date.now() + 7 * 864e5).toISOString(),
 });
-const { data: qA, error: qErr } = await seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkA) });
+const { data: qA, error: qErr } = await seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkA, 480, "mayoreo") });
 check("folio de cotización del negocio", !qErr && qA?.folio === "COT-0001", qErr?.message ?? qA?.folio);
 check("save_quote guarda los items sin unitCost", qA?.items?.every((i) => !("unitCost" in i)));
+check("save_quote recalcula lista, descuento, subtotal y total en el servidor", qA?.subtotal_list === 7188 && qA.discount === 1428 && qA.subtotal === 5760 && qA.total === 6040, `${qA?.subtotal_list}/${qA?.discount}/${qA?.subtotal}/${qA?.total}`);
+// Se edita qA (con su id) para no gastar un folio.
+const { data: qFake } = await ownerA.db.rpc("save_quote", { p: { ...quoteOf(custA, pA, vkA, 480, "mayoreo"), id: qA.id, subtotal: 1, total: 1, discount: 9999, subtotalList: 1 } });
+check("totales falsos del navegador se ignoran", qFake?.id === qA.id && qFake.subtotal === 5760 && qFake.total === 6040 && qFake.discount === 1428, `${qFake?.subtotal}/${qFake?.total}`);
+await expectError("save_quote solo guarda borrador o enviada", seller.db.rpc("save_quote", { p: { ...quoteOf(custA, pA, vkA, 480, "mayoreo"), status: "aceptada" } }), /Estado de cotización inválido/);
+await expectError("vendedor no cotiza debajo del piso de su nivel", seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkA, 469, "mayoreo") }), /Precio menor al de catálogo/);
+await expectError("save_quote rechaza renglones con variantKey repetido", ownerA.db.rpc("save_quote", { p: { ...quoteOf(custA, pA, vkA, 480, "mayoreo"), items: [quoteOf(custA, pA, vkA, 480, "mayoreo").items[0], quoteOf(custA, pA, vkA, 480, "mayoreo").items[0]] } }), /Producto repetido/);
+await expectError("save_quote rechaza cantidades no enteras", ownerA.db.rpc("save_quote", { p: { ...quoteOf(custA, pA, vkA, 480, "mayoreo"), items: [{ ...quoteOf(custA, pA, vkA, 480, "mayoreo").items[0], qty: 1.5 }] } }), /Cantidad inválida/);
+await expectError("save_quote rechaza un anticipo fuera de 0..1", ownerA.db.rpc("save_quote", { p: { ...quoteOf(custA, pA, vkA, 480, "mayoreo"), depositPct: 2 } }), /Anticipo inválido/);
+await expectError("save_quote rechaza un envío NaN", ownerA.db.rpc("save_quote", { p: { ...quoteOf(custA, pA, vkA, 480, "mayoreo"), shipping: "NaN" } }), /Envío inválido/);
+await expectDenied("la cotización ya no se edita con UPDATE directo", seller.db.from("quotes").update({ status: "aceptada" }).eq("id", qA.id).select());
+const { data: qSt, error: qStErr } = await seller.db.rpc("set_quote_status", { p_id: qA.id, p_status: "aceptada" });
+check("set_quote_status cambia el estado", !qStErr && qSt?.status === "aceptada", qStErr?.message);
+await expectError("set_quote_status nunca va hacia convertida", seller.db.rpc("set_quote_status", { p_id: qA.id, p_status: "convertida" }), /La cotización ya es un pedido/);
+await expectError("set_quote_status rechaza un estado inexistente", seller.db.rpc("set_quote_status", { p_id: qA.id, p_status: "perdida" }), /Estado de cotización inválido/);
+await expectError("anon no ejecuta set_quote_status", anon.rpc("set_quote_status", { p_id: qA.id, p_status: "aceptada" }), /permission denied/);
 const { data: conv, error: convErr } = await seller.db.rpc("convert_quote", { p_quote: qA.id, p_deposit: { amount: 2954, method: "transferencia", note: "Anticipo" } });
 check("cotización → pedido apartado de mayoreo", !convErr && conv?.status === "apartado" && conv?.channel === "mayoreo", convErr?.message ?? conv?.status);
 check("el mayoreo se aparta de la sucursal que lo surte", conv?.branch === principalA.id);
 check("la conversión toma el siguiente folio de pedido", conv?.folio === "V-1004", conv?.folio);
 await expectError("no se convierte dos veces", seller.db.rpc("convert_quote", { p_quote: qA.id, p_deposit: {} }), /ya es un pedido/);
-const { data: qA2 } = await seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkA) });
+const { data: qA2 } = await seller.db.rpc("save_quote", { p: quoteOf(custA, pA, vkA, 480, "mayoreo") });
 check("la segunda cotización lleva el siguiente folio", qA2?.folio === "COT-0002", qA2?.folio);
+await expectError("set_quote_status no sale de convertida", seller.db.rpc("set_quote_status", { p_id: qA.id, p_status: "borrador" }), /La cotización ya es un pedido/);
 await ownerA.db.from("branches").update({ is_warehouse: false }).eq("id", principalA.id);
 await expectError("convertir exige una sucursal que surta mayoreo", seller.db.rpc("convert_quote", { p_quote: qA2.id, p_deposit: {} }), /Configura qué sucursal surte el mayoreo/);
 await ownerA.db.from("branches").update({ is_warehouse: true }).eq("id", principalA.id);
 
-// Traspaso y conteo
-const { error: trErr } = await seller.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkA, qty: 3 }], p_from: principalA.id, p_to: bodega.id });
-check("traspaso entre sucursales", !trErr, trErr?.message);
+// Traspaso y conteo: el vendedor ya no puede; encargado y dueño sí
+await expectError("vendedor no traspasa", seller.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkA, qty: 3 }], p_from: principalA.id, p_to: bodega.id }), NO_STOCK);
+await expectError("vendedor no cuenta el inventario", seller.db.rpc("set_stock_count", { p_branch: bodega.id, p_entries: [{ variantKey: vkA, qty: 10 }] }), NO_STOCK);
+const { error: trErr } = await encargado.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkA, qty: 3 }], p_from: principalA.id, p_to: bodega.id });
+check("encargado traspasa entre sucursales (aunque no sea la suya)", !trErr, trErr?.message);
 const { data: trMov } = await ownerA.db.from("movements").select("note, branch").eq("type", "traspaso").eq("branch", principalA.id).limit(1).single();
 check("el kardex anota el destino del traspaso", trMov?.note === "Hacia Sucursal Norte", trMov?.note);
-const { data: changed, error: cntErr } = await seller.db.rpc("set_stock_count", { p_branch: bodega.id, p_entries: [{ variantKey: vkA, qty: 10 }] });
-check("conteo físico fija existencia", !cntErr && changed === 1, cntErr?.message);
+const { data: changed, error: cntErr } = await encargado.db.rpc("set_stock_count", { p_branch: bodega.id, p_entries: [{ variantKey: vkA, qty: 10 }] });
+check("encargado fija la existencia con un conteo físico", !cntErr && changed === 1, cntErr?.message);
+const { data: ownerCount, error: ownerCountErr } = await ownerA.db.rpc("set_stock_count", { p_branch: bodega.id, p_entries: [{ variantKey: vkA, qty: 10 }] });
+check("el dueño también cuenta (sin cambios no hay movimiento)", !ownerCountErr && ownerCount === 0, ownerCountErr?.message);
+const { error: ownerTrErr } = await ownerA.db.rpc("transfer_stock", { p_entries: [{ variantKey: vkA, qty: 0 }], p_from: principalA.id, p_to: bodega.id });
+check("el dueño también traspasa (en 0 no mueve nada)", !ownerTrErr, ownerTrErr?.message);
 
 // Gastos: solo dueño
 const { error: exErr } = await ownerA.db.from("expenses").insert({ category: "renta", description: "Renta del local", amount: 22000, method: "transferencia" });
 check("dueño registra gasto", !exErr, exErr?.message);
 const { data: sellerExpenses } = await seller.db.from("expenses").select("*");
 check("vendedor no ve gastos", Array.isArray(sellerExpenses) && sellerExpenses.length === 0);
+check("encargado no ve gastos ni costos", (await encargado.db.from("expenses").select("id")).data?.length === 0 && (await encargado.db.from("product_costs").select("*")).data?.length === 0);
+await expectError("encargado no registra gastos", encargado.db.from("expenses").insert({ category: "otros", description: "x", amount: 1, method: "efectivo" }).select().single());
+await expectError("encargado no edita el negocio", encargado.db.rpc("update_business", { p_name: "Otro", p_order_prefix: "X-", p_quote_prefix: "Y-" }), /Solo el dueño/);
+await expectError("encargado no administra el equipo", encargado.db.rpc("set_member", { p_id: seller.id, p_role: "encargado", p_branch: null }), /Solo el dueño/);
 await expectError("vendedor no registra gastos", seller.db.from("expenses").insert({ category: "otros", description: "x", amount: 1, method: "efectivo" }).select().single());
 
 // Configuración y administración del negocio
@@ -220,7 +284,7 @@ await expectDenied("vendedor no cambia la configuración", seller.db.from("setti
 await expectError("vendedor no edita el negocio", seller.db.rpc("update_business", { p_name: "Otro", p_order_prefix: "X-", p_quote_prefix: "Y-" }), /Solo el dueño/);
 await expectError("vendedor no renueva el código de invitación", seller.db.rpc("regenerate_invite_code"), /Solo el dueño/);
 const { data: team } = await ownerA.db.from("profiles").select("id");
-check("dueño ve a todo su equipo", team?.length === 3, `${team?.length} perfiles`);
+check("dueño ve a todo su equipo", team?.length === 4, `${team?.length} perfiles`);
 const { data: ownProfiles } = await seller.db.from("profiles").select("id");
 check("vendedor solo ve su propio perfil", ownProfiles?.length === 1);
 const { data: movs } = await ownerA.db.from("movements").select("type");
@@ -272,7 +336,7 @@ for (const [who, db, own, other] of [
   ["B", ownerB.db, bizB.id, bizA.id],
   ["A", ownerA.db, bizA.id, bizB.id],
 ]) {
-  for (const table of ["businesses", "branches", "profiles", "settings", "products", "stock", "movements", "customers", "orders", "quotes", "expenses", "product_costs", "order_costs"]) {
+  for (const table of ["businesses", "branches", "business_members", "settings", "products", "stock", "movements", "customers", "orders", "quotes", "expenses", "product_costs", "order_costs"]) {
     const { data: rows, error } = await db.from(table).select("*");
     const idOf = (r) => (table === "businesses" ? r.id : r.business_id);
     check(`${who} solo lee filas de su negocio en ${table}`, !error && rows.length > 0 && rows.every((r) => idOf(r) === own) && !rows.some((r) => idOf(r) === other), error?.message ?? `${rows?.length} filas`);
@@ -292,6 +356,8 @@ await expectDenied("B no edita productos de A", ownerB.db.from("products").updat
 await expectDenied("B no borra productos de A", ownerB.db.from("products").delete().eq("id", pA.id).select());
 await expectDenied("B no edita clientes de A", ownerB.db.from("customers").update({ name: "Hackeado" }).eq("id", custA.id).select());
 await expectDenied("B no edita cotizaciones de A", ownerB.db.from("quotes").update({ status: "rechazada" }).eq("id", qA2.id).select());
+await expectError("B no cambia el estado de una cotización de A", ownerB.db.rpc("set_quote_status", { p_id: qA2.id, p_status: "rechazada" }), /Cotización no encontrada/);
+await expectDenied("B no edita la membresía de un miembro de A", ownerB.db.from("business_members").update({ role: "pendiente" }).eq("user_id", seller.id).select());
 await expectDenied("B no edita la configuración de A", ownerB.db.from("settings").update({ value: { enabled: true } }).eq("business_id", bizA.id).select());
 await expectDenied("B no edita sucursales de A", ownerB.db.from("branches").update({ name: "Hackeada" }).eq("id", principalA.id).select());
 await expectDenied("B no edita el negocio A", ownerB.db.from("businesses").update({ name: "Hackeado" }).eq("id", bizA.id).select());
@@ -327,16 +393,16 @@ check("tras los intentos de B, el inventario y los pedidos de A siguen intactos"
 // ---------------------------------------------------------------------------
 // invite-lookup: máximo 30 intentos por IP (cf-connecting-ip) en 10 minutos
 // ---------------------------------------------------------------------------
-const limited = newClient(`test-${Date.now()}`);
+const limited = newClient(fakeIp());
 let answered = 0;
 for (let i = 0; i < 30; i++) if (!(await inviteLookup(limited, "ZZZZZZZZ")).error) answered++;
 check("invite-lookup responde las primeras 30 llamadas de una IP", answered === 30, `${answered} respuestas`);
-const over = await inviteLookup(limited, "ZZZZZZZZ", { "x-forwarded-for": `otra-${Date.now()}` });
+const over = await inviteLookup(limited, "ZZZZZZZZ", { "x-forwarded-for": fakeIp() });
 check("la llamada 31 se rechaza con 429 aunque cambie x-forwarded-for", over.error?.status === 429 && /Demasiados intentos/.test(over.error.message), over.error?.message ?? "no hubo error");
-const burst = newClient(`rafaga-${Date.now()}`);
+const burst = newClient(fakeIp());
 const burstAnswered = (await Promise.all(Array.from({ length: 40 }, () => inviteLookup(burst, "ZZZZZZZZ")))).filter((r) => !r.error).length;
 check("una ráfaga de 40 en paralelo responde solo 30", burstAnswered === 30, `${burstAnswered} respuestas`);
-const { data: otherKey, error: otherKeyErr } = await inviteLookup(newClient(`test-otra-${Date.now()}`), bizB.invite_code);
+const { data: otherKey, error: otherKeyErr } = await inviteLookup(newClient(fakeIp()), bizB.invite_code);
 check("otra IP sigue respondiendo", !otherKeyErr && otherKey === "Boutique Beta", otherKeyErr?.message);
 
 // ---------------------------------------------------------------------------
@@ -391,10 +457,10 @@ check("prueba vencida → vencida", m1?.state === "vencida" && m1.paidUntil === 
 await expectError("vencida no vende", sellM(), /Membresía vencida/);
 await expectError("vencida no cotiza", quoteM(), /Membresía vencida/);
 await expectError("vencida no convierte cotizaciones", ownerM.db.rpc("convert_quote", { p_quote: qM.id, p_deposit: {} }), /Membresía vencida/);
-await expectDenied("vencida no cambia el estado de cotizaciones", ownerM.db.from("quotes").update({ status: "aceptada" }).eq("id", qM.id).select());
+await expectError("vencida no cambia el estado de cotizaciones", ownerM.db.rpc("set_quote_status", { p_id: qM.id, p_status: "aceptada" }), /Membresía vencida/);
 await expectError("vencida no registra gastos", expenseM());
 check("vencida no lee sus tablas", (await ownerM.db.from("products").select("id")).data?.length === 0 && (await ownerM.db.from("quotes").select("id")).data?.length === 0);
-check("vencida sigue leyendo su perfil", (await ownerM.db.from("profiles").select("role").eq("id", ownerM.id)).data?.[0]?.role === "dueno");
+check("vencida sigue leyendo su perfil y su membresía", (await ownerM.db.from("profiles").select("id").eq("id", ownerM.id)).data?.length === 1 && (await ownerM.db.from("business_members").select("role").eq("user_id", ownerM.id)).data?.[0]?.role === "dueno");
 
 // Periodo pagado vencido: 3 días de gracia con todo el sistema, después bloqueo
 await setBiz({ paid_until: daysAgo(1) });
@@ -408,6 +474,7 @@ check("pasada la gracia queda vencida", m3?.state === "vencida", m3?.state);
 await expectError("pasada la gracia no vende", sellM(), /Membresía vencida/);
 
 // Marcar pagado: el periodo corre desde el pago y desbloquea
+await expectError("no se marcan más de 24 meses", admin.db.rpc("admin_mark_paid", { p_business: bizM.id, p_months: 25, p_amount: 100, p_note: null }), /Meses inválidos/);
 await expectError("no se marcan 0 meses", admin.db.rpc("admin_mark_paid", { p_business: bizM.id, p_months: 0, p_amount: 100, p_note: null }), /Meses inválidos/);
 await expectError("meses nulos se rechazan al marcar pagado", admin.db.rpc("admin_mark_paid", { p_business: bizM.id, p_months: null, p_amount: 100, p_note: null }), /Meses inválidos/);
 const { error: payErr } = await admin.db.rpc("admin_mark_paid", { p_business: bizM.id, p_months: 1, p_amount: 4798, p_note: "Alta + primera mensualidad" });
@@ -434,14 +501,16 @@ await expectError("suspendido no administra el equipo", ownerM.db.rpc("set_membe
 await expectError("suspendido no escribe gastos", expenseM());
 const m6 = await mem(ownerM.db);
 check("my_membership responde con la cuenta suspendida", m6?.state === "suspendida" && m6.suspendedReason === "Contracargo", m6?.state);
-check("el perfil propio sigue legible", (await ownerM.db.from("profiles").select("id, role").eq("id", ownerM.id)).data?.[0]?.role === "dueno");
+check("el perfil propio y la membresía siguen legibles", (await ownerM.db.from("profiles").select("id").eq("id", ownerM.id)).data?.length === 1 && (await ownerM.db.from("business_members").select("role").eq("user_id", ownerM.id)).data?.[0]?.role === "dueno");
+check("my_businesses sigue respondiendo con la cuenta suspendida", (await ownerM.db.rpc("my_businesses")).data?.[0]?.state === "suspendida");
 await admin.db.rpc("admin_reactivate", { p_business: bizM.id });
 const m7 = await mem(ownerM.db);
 check("reactivar devuelve el acceso", m7?.state === "activa" && m7.suspendedReason === null && !(await sellM()).error && (await ownerM.db.from("products").select("id")).data?.length === 1, m7?.state);
 
 // Revisión: el negocio recién registrado espera al administrador; rechazar no borra nada y se puede aceptar después
-const { client: ownerR, error: signUpR } = await signUp(mail("dueno-r"), { name: "Dueño Rho", business_name: "Boutique Rho" });
-const bizR = (await ownerR.from("profiles").select("business_id").single()).data?.business_id;
+const { client: ownerR, error: signUpR } = await signUp(mail("dueno-r"), { name: "Dueño Rho" });
+await signIn(ownerR, mail("dueno-r"));
+const bizR = await createBusiness(ownerR, "Boutique Rho", "boutique", { approved: false });
 const editR = () => ownerR.rpc("update_business", { p_name: "Otro", p_order_prefix: "X-", p_quote_prefix: "Y-" });
 const r0 = await mem(ownerR);
 check("negocio nuevo nace en revisión", !signUpR && !!bizR && r0?.state === "revision", signUpR?.message ?? r0?.state);
@@ -519,5 +588,63 @@ const m11 = await mem(ownerM.db);
 check("con la cuenta suspendida sigue recibiendo a dónde pagar", m11?.state === "suspendida" && m11.payment.bank === "BBVA" && m11.priceMonthly === 999, JSON.stringify(m11));
 await admin.db.rpc("admin_reactivate", { p_business: bizM.id });
 await admin.db.from("platform_settings").update(COBRO_INICIAL).eq("id", true);
+
+// ---------------------------------------------------------------------------
+// create_order no confía en el navegador: precio mínimo, estado, vendedor y NaN (negocio A; el nivel "mayoreo" = 480)
+// ---------------------------------------------------------------------------
+await ownerA.db.rpc("move_stock", { p_entries: [{ variantKey: vkA, qty: 20 }], p_branch: centro.id, p_type: "entrada" });
+await ownerA.db.rpc("move_stock", { p_entries: [{ variantKey: vkA, qty: 20 }], p_branch: principalA.id, p_type: "entrada" });
+const priced = (price, extra = {}, qty = 1) =>
+  order(pA, vkA, centro.id, qty, { items: [{ ...item(pA, vkA, qty), unitPrice: price }], payments: [{ amount: price * qty, method: "efectivo" }], ...extra });
+const sell = (db, p) => db.rpc("create_order", { p });
+const MIN_MSG = /Precio menor al de catálogo/;
+
+await expectError("vendedor no vende debajo del precio de catálogo", sell(seller.db, priced(100)), MIN_MSG);
+await expectError("vendedor no vende 1 centavo debajo del catálogo", sell(seller.db, priced(598.99)), MIN_MSG);
+await expectError("un nivel con descuento 0 no baja el mínimo del catálogo", sell(seller.db, priced(469, { tierId: "lista" })), MIN_MSG);
+await expectError("vendedor no vende debajo del precio de su nivel", sell(seller.db, priced(479, { tierId: "mayoreo" }, 6)), MIN_MSG);
+await expectError("encargado tampoco vende debajo del precio de catálogo", sell(encargado.db, priced(100)), MIN_MSG);
+await expectError("vendedor no usa un nivel sin alcanzar sus piezas mínimas", sell(seller.db, priced(480, { tierId: "mayoreo" }, 5)), /no alcanza las piezas mínimas/);
+await expectError("pedido con variantKey repetido", sell(seller.db, { ...priced(599), items: [item(pA, vkA, 1), item(pA, vkA, 1)] }), /Producto repetido en el pedido/);
+await expectError("pedido de más de 200 renglones", sell(ownerA.db, { ...priced(599), items: Array.from({ length: 201 }, (_, i) => item(pA, `${vkA}${i}`, 1)) }), /hasta 200 renglones/);
+await expectError("cantidad no entera", sell(seller.db, priced(599, {}, 1.5)), /Cantidad inválida/);
+await expectError("el nivel inexistente se rechaza", sell(seller.db, priced(480, { tierId: "fantasma" })), /Nivel de mayoreo inválido/);
+const { data: oTier, error: oTierErr } = await sell(seller.db, priced(480, { tierId: "mayoreo" }, 6));
+check("vendedor vende al precio exacto de un nivel de mayoreo", !oTierErr && oTier?.items?.[0]?.unitPrice === 480 && oTier.tier_id === "mayoreo", oTierErr?.message);
+const { data: oEnc, error: oEncErr } = await sell(encargado.db, priced(599, { seller: "Falso" }));
+check("el encargado vende como vendedor en el mostrador de su sucursal", !oEncErr && oEnc?.seller === "Eli", oEncErr?.message ?? oEnc?.seller);
+await expectError("el encargado vende solo en su sucursal asignada", sell(encargado.db, { ...priced(599), branch: principalA.id }), /sucursal asignada/);
+const { data: oFree, error: oFreeErr } = await sell(ownerA.db, priced(1, { seller: "Falso" }));
+check("el dueño fija el precio libremente", !oFreeErr && oFree?.total === 1, oFreeErr?.message);
+check("el dueño también queda con el nombre de su perfil como vendedor", oFree?.seller === "Dueña Alfa", oFree?.seller);
+
+const { data: oFake } = await sell(seller.db, priced(599, { seller: "Falso" }));
+check("un seller falso se reemplaza por el nombre del perfil", oFake?.seller === "Karla", oFake?.seller);
+for (const status of ["cancelado", "pagado", "entregado"]) {
+  const { data: o } = await sell(seller.db, priced(599, { payments: [], status }));
+  check(`status '${status}' sin pago queda pendiente`, o?.status === "pendiente", o?.status);
+}
+const { data: oPartial } = await sell(seller.db, priced(599, { payments: [{ amount: 100, method: "efectivo" }], status: "pagado" }));
+check("status 'pagado' con pago parcial queda apartado", oPartial?.status === "apartado", oPartial?.status);
+const { data: oWeb } = await sell(seller.db, priced(599, { channel: "whatsapp", status: "entregado" }));
+check("'entregado' fuera del mostrador se deriva de los pagos (pagado)", oWeb?.status === "pagado", oWeb?.status);
+const { data: oPos, error: oPosErr } = await sell(seller.db, priced(599, { status: "entregado" }));
+check("POS: venta de mostrador pagada con 'entregado' queda entregada", !oPosErr && oPos?.status === "entregado", oPosErr?.message ?? oPos?.status);
+
+for (const [who, db] of [["vendedor", seller.db], ["dueño", ownerA.db]]) {
+  await expectError(`${who}: unitPrice NaN se rechaza`, sell(db, priced("NaN", { payments: [] })), /Precio inválido/);
+  await expectError(`${who}: descuento NaN se rechaza`, sell(db, priced(599, { discount: "NaN" })), /Descuento inválido/);
+  await expectError(`${who}: envío NaN se rechaza`, sell(db, priced(599, { shipping: "NaN" })), /Envío inválido/);
+  await expectError(`${who}: monto de pago NaN se rechaza`, sell(db, priced(599, { payments: [{ amount: "NaN", method: "efectivo" }] })), /Monto de pago inválido/);
+}
+
+// Conversión de cotizaciones: la regla del precio también vale ahí (sale del nivel guardado, no de la cotización)
+// Solo el dueño puede guardar una cotización bajo el piso del nivel; el vendedor la convertiría con el precio de ese renglón.
+const { data: qLow } = await ownerA.db.rpc("save_quote", { p: quoteOf(custA, pA, vkA, 469, "mayoreo") });
+await expectError("vendedor no convierte una cotización con precio menor al de su nivel", seller.db.rpc("convert_quote", { p_quote: qLow.id, p_deposit: {} }), MIN_MSG);
+const { data: qLowStill } = await ownerA.db.from("quotes").select("status").eq("id", qLow.id).single();
+check("la conversión rechazada deja la cotización sin convertir", qLowStill?.status === "enviada", qLowStill?.status);
+const { data: convLow, error: convLowErr } = await ownerA.db.rpc("convert_quote", { p_quote: qLow.id, p_deposit: {} });
+check("el dueño sí convierte esa cotización", !convLowErr && convLow?.channel === "mayoreo" && convLow.total === 12 * 469 + 280, convLowErr?.message);
 
 report();

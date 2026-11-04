@@ -12,11 +12,12 @@ import { mxn, num, pct } from "@/lib/format";
 import { byChannel, inRange, isSale, orderCost, orderNet, periodRange, productStats, type Period } from "@/lib/metrics";
 import { useBranchName, useCategories, useErp, usePosBranches, useWholesaleEnabled } from "@/lib/store";
 import { cn } from "@/lib/utils";
+import { ReportesRestaurante } from "./_components/reportes-restaurante";
 
 const WEEKDAYS = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
 const ALL_CATEGORIES = "todas";
 
-export default function ReportesPage() {
+function ReportesBoutique() {
   const orders = useErp((s) => s.orders);
   const products = useErp((s) => s.products);
   const customers = useErp((s) => s.customers);
@@ -345,4 +346,9 @@ export default function ReportesPage() {
       </div>
     </>
   );
+}
+
+export default function ReportesPage() {
+  const kind = useErp((s) => s.kind);
+  return kind === "restaurante" ? <ReportesRestaurante /> : <ReportesBoutique />;
 }

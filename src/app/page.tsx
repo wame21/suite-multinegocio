@@ -26,6 +26,7 @@ import {
   ShareBar,
   StatusBadge,
 } from "@/components/erp";
+import { RestoDashboard } from "@/components/restaurante/dashboard";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { CHANNEL_COLOR, CHANNEL_LABEL } from "@/lib/constants";
@@ -50,7 +51,7 @@ function greeting() {
   return h < 12 ? "Buenos días" : h < 19 ? "Buenas tardes" : "Buenas noches";
 }
 
-export default function Dashboard() {
+function BoutiqueDashboard() {
   const orders = useErp((s) => s.orders);
   const expenses = useErp((s) => s.expenses);
   const products = useErp((s) => s.products);
@@ -329,4 +330,10 @@ export default function Dashboard() {
       </Card>
     </>
   );
+}
+
+/** Cada giro tiene su panel; la boutique conserva el suyo sin cambios. */
+export default function Dashboard() {
+  const kind = useErp((s) => s.kind);
+  return kind === "restaurante" ? <RestoDashboard /> : <BoutiqueDashboard />;
 }

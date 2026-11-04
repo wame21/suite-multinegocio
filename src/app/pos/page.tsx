@@ -38,7 +38,7 @@ export default function PosPage() {
   const posBranches = usePosBranches();
   const owner = useIsOwner();
   const [selectedBranch, setBranch] = useState<BranchId | undefined>();
-  // Los vendedores solo cobran en su sucursal asignada; el dueño puede elegir (por defecto la primera).
+  // Vendedores y encargados solo cobran en su sucursal asignada; el dueño puede elegir (por defecto la primera).
   const seller = posBranches.find((b) => b.id === profile?.branch);
   const current = owner ? (posBranches.find((b) => b.id === selectedBranch) ?? posBranches[0]) : seller;
   const branch = current?.id ?? "";

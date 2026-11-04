@@ -286,18 +286,42 @@ const MEMBERSHIP: Membership = {
 
 const profileRow = (patch: Row = {}): Row => ({
   id: "u-1",
-  business_id: BUSINESS_ID,
   name: "Ana Dueña",
   email: "ana@boutique.mx",
+  created_at: "2026-01-01T00:00:00Z",
+  active_business_id: BUSINESS_ID,
+  ...patch,
+});
+
+/** Fila de `business_members`: el rol y la sucursal viven aquí, no en `profiles`. */
+const memberRow = (patch: Row = {}): Row => ({
+  user_id: "u-1",
+  business_id: BUSINESS_ID,
   role: "dueno",
   branch: null,
   created_at: "2026-01-01T00:00:00Z",
   ...patch,
 });
 
+/** Fila de `my_businesses()` del negocio activo. */
+const ownBusiness = (patch: Row = {}): Row => ({
+  id: BUSINESS_ID,
+  name: "Boutique Aurora",
+  kind: "boutique",
+  role: "dueno",
+  state: "prueba",
+  endsAt: null,
+  rejectionReason: null,
+  monthSales: 0,
+  active: true,
+  createdAt: "2026-01-01T00:00:00Z",
+  ...patch,
+});
+
 const businessRow = (patch: Row = {}): Row => ({
   id: BUSINESS_ID,
   name: "Boutique Aurora",
+  kind: "boutique",
   invite_code: "ABCD2345",
   order_prefix: "V-",
   quote_prefix: "COT-",
@@ -467,6 +491,8 @@ const SETTINGS_ROWS: Row[] = [
 /** Datos completos de un dueño con negocio configurado. */
 function seedOwner() {
   fake.tables.profiles = [profileRow()];
+  fake.tables.business_members = [memberRow()];
+  fake.on("rpc.my_businesses", () => ok([ownBusiness()]));
   fake.on("rpc.my_membership", () => ok(MEMBERSHIP));
   fake.tables.businesses = [businessRow()];
   fake.tables.branches = [
@@ -536,7 +562,8 @@ describe("init", () => {
     expect(s.error).toBeUndefined();
     expect(s.role).toBe("dueno");
     expect(s.profile).toEqual(PROFILE);
-    expect(s.business).toEqual({ id: BUSINESS_ID, name: "Boutique Aurora", inviteCode: "ABCD2345", orderPrefix: "V-", quotePrefix: "COT-" });
+    expect(s.kind).toBe("boutique");
+    expect(s.business).toEqual({ id: BUSINESS_ID, name: "Boutique Aurora", kind: "boutique", inviteCode: "ABCD2345", orderPrefix: "V-", quotePrefix: "COT-" });
     expect(s.branches.map((b) => b.id)).toEqual(["br-1", "br-2", "br-3"]);
     expect(s.branches[0]).toEqual(branch({ isWarehouse: true }));
     // address null -> "" y sort como texto -> número
@@ -633,7 +660,7 @@ describe("init", () => {
     seedOwner();
     await state().init();
     const queried = new Set(fake.calls.filter((c) => c.kind === "table").map((c) => c.name));
-    expect(queried).toEqual(new Set(["profiles", "businesses", "products", "product_costs", "stock", "movements", "orders", "order_costs", "customers", "quotes", "expenses", "branches", "settings"]));
+    expect(queried).toEqual(new Set(["profiles", "business_members", "businesses", "products", "product_costs", "stock", "movements", "orders", "order_costs", "customers", "quotes", "expenses", "branches", "settings"]));
     expect(opArgs(tableCalls("profiles")[0], "eq")).toEqual(["id", "u-1"]);
     expect(opArgs(tableCalls("businesses")[0], "eq")).toEqual(["id", BUSINESS_ID]);
   });
@@ -688,8 +715,81 @@ describe("init", () => {
     expect(state().live).toBe(false);
   });
 
+  it("una cuenta de dueño sin negocio activo queda lista sin cargar nada", async () => {
+    fake.tables.profiles = [profileRow({ active_business_id: null })];
+    await state().init();
+    const s = state();
+
+    expect(s.status).toBe("ready");
+    expect(s.profile).toMatchObject({ businessId: null, role: "dueno" });
+    expect(s.active).toBeNull();
+    expect(s.business).toBeNull();
+    expect(fake.calls.map((c) => c.name)).toEqual(["profiles"]);
+    expect(fake.channels).toHaveLength(0);
+  });
+
+  it("en restaurante toma el giro y el rol de la membresía y no carga ni escucha tablas de boutique", async () => {
+    seedOwner();
+    fake.tables.business_members = [memberRow({ role: "cajero" })];
+    fake.on("rpc.my_businesses", () => ok([ownBusiness({ kind: "restaurante", role: "cajero" })]));
+    await state().init();
+    const s = state();
+
+    expect(s.status).toBe("ready");
+    expect(s.kind).toBe("restaurante");
+    expect(s.role).toBe("cajero");
+    expect(s.active?.name).toBe("Boutique Aurora");
+    expect(new Set(fake.calls.filter((c) => c.kind === "table").map((c) => c.name))).toEqual(new Set(["profiles", "business_members"]));
+    expect(s.products).toEqual([]);
+    expect(fake.channels).toHaveLength(1);
+    expect(fake.channels[0].listeners).toHaveLength(0);
+  });
+
+  it("switchBusiness activa el negocio, reinicia el store y el canal realtime y vuelve a cargar", async () => {
+    seedOwner();
+    await state().init();
+    const first = fake.channels[0];
+    expect(state().products).toHaveLength(1);
+
+    fake.on("rpc.set_active_business", () => ok(null));
+    fake.tables.profiles = [profileRow({ active_business_id: "b-2" })];
+    fake.tables.business_members = [memberRow({ business_id: "b-2", role: "dueno" })];
+    fake.tables.businesses = [businessRow({ id: "b-2", name: "Café Aurora", kind: "restaurante" })];
+    fake.on("rpc.my_businesses", () => ok([ownBusiness({ id: "b-2", name: "Café Aurora", kind: "restaurante" })]));
+    await state().switchBusiness("b-2");
+
+    expect(onlyRpc("set_active_business").args).toEqual({ p_id: "b-2" });
+    expect(fake.removeChannel).toHaveBeenCalledWith(first);
+    expect(state().kind).toBe("restaurante");
+    expect(state().active?.name).toBe("Café Aurora");
+    // nada del negocio anterior queda en memoria
+    expect(state().products).toEqual([]);
+    expect(state().business?.id).toBe("b-2");
+    expect(state().status).toBe("ready");
+  });
+
+  it("switchBusiness propaga el error y no toca el store", async () => {
+    seedOwner();
+    await state().init();
+    fake.on("rpc.set_active_business", () => fail("Negocio no encontrado"));
+    await expect(state().switchBusiness("x")).rejects.toThrow("Negocio no encontrado");
+    expect(state().products).toHaveLength(1);
+  });
+
+  it("reset suelta datos y canal", async () => {
+    seedOwner();
+    await state().init();
+    await state().reset();
+    expect(state().status).toBe("loading");
+    expect(state().profile).toBeNull();
+    expect(state().products).toEqual([]);
+    expect(state().live).toBe(false);
+  });
+
   it("un usuario pendiente queda listo sin cargar datos del negocio", async () => {
-    fake.tables.profiles = [profileRow({ role: "pendiente" })];
+    fake.tables.profiles = [profileRow()];
+    fake.tables.business_members = [memberRow({ role: "pendiente" })];
+    fake.on("rpc.my_businesses", () => ok([ownBusiness({ role: "pendiente", kind: "restaurante", name: "Café Aurora" })]));
     await state().init();
     const s = state();
 
@@ -699,13 +799,14 @@ describe("init", () => {
     expect(s.business).toBeNull();
     expect(s.branches).toEqual([]);
     expect(s.products).toEqual([]);
-    expect(fake.calls.map((c) => c.name)).toEqual(["profiles"]);
+    expect(s.active).toMatchObject({ name: "Café Aurora", kind: "restaurante" });
+    expect(fake.calls.map((c) => c.name)).toEqual(["profiles", "business_members", "my_businesses"]);
     expect(fake.channels).toHaveLength(0);
   });
 
   it("un vendedor aprobado recibe el rol vendedor y carga sus datos", async () => {
     seedOwner();
-    fake.tables.profiles = [profileRow({ role: "vendedor", branch: "br-1" })];
+    fake.tables.business_members = [memberRow({ role: "vendedor", branch: "br-1" })];
     await state().init();
     expect(state().role).toBe("vendedor");
     expect(state().profile?.branch).toBe("br-1");
@@ -714,7 +815,7 @@ describe("init", () => {
 
   it("un vendedor no consulta ni escucha los costos y los ve en 0", async () => {
     seedOwner();
-    fake.tables.profiles = [profileRow({ role: "vendedor", branch: "br-1" })];
+    fake.tables.business_members = [memberRow({ role: "vendedor", branch: "br-1" })];
     await state().init();
 
     const queried = new Set(fake.calls.map((c) => c.name));
@@ -786,7 +887,7 @@ describe("init", () => {
     expect(state().membership?.suspendedReason).toBe(reason);
     expect(state().business).toBeNull();
     expect(state().products).toEqual([]);
-    expect(new Set(fake.calls.map((c) => c.name))).toEqual(new Set(["profiles", "my_membership"]));
+    expect(new Set(fake.calls.map((c) => c.name))).toEqual(new Set(["profiles", "business_members", "my_businesses", "my_membership"]));
     expect(fake.channels).toHaveLength(0);
   });
 
@@ -1099,8 +1200,8 @@ describe("inventario", () => {
   });
 
   it("moveStock propaga el error y no recarga", async () => {
-    fake.on("rpc.move_stock", () => fail("Solo el dueño registra entradas de mercancía"));
-    await expect(state().moveStock([], "br-1", "entrada")).rejects.toThrow("Solo el dueño registra entradas de mercancía");
+    fake.on("rpc.move_stock", () => fail("Solo el dueño o el encargado mueven inventario"));
+    await expect(state().moveStock([], "br-1", "entrada")).rejects.toThrow("Solo el dueño o el encargado mueven inventario");
     expect(tableCalls("stock")).toHaveLength(0);
   });
 
@@ -1168,24 +1269,22 @@ describe("cotizaciones", () => {
     expect(state().quotes).toEqual([]);
   });
 
-  it("setQuoteStatus actualiza solo el estado de la fila en la tabla quotes", async () => {
+  it("setQuoteStatus llama set_quote_status con p_id y p_status, sin tocar la tabla quotes", async () => {
     fake.tables.quotes = [quoteRow()];
     await state().reload(["quotes"]);
-    fake.on("quotes.update", () => ok(quoteRow({ status: "aceptada" })));
+    fake.on("rpc.set_quote_status", () => ok(quoteRow({ status: "aceptada" })));
 
     await state().setQuoteStatus("q-1", "aceptada");
 
-    const [call] = tableCalls("quotes", "update");
-    expect(opArgs(call, "update")).toEqual([{ status: "aceptada" }]);
-    expect(opArgs(call, "eq")).toEqual(["id", "q-1"]);
-    expect(methods(call)).toEqual(["update", "eq", "select", "single"]);
+    expect(onlyRpc("set_quote_status").args).toEqual({ p_id: "q-1", p_status: "aceptada" });
+    expect(tableCalls("quotes", "update")).toHaveLength(0);
     expect(state().quotes).toHaveLength(1);
     expect(state().quotes[0].status).toBe("aceptada");
   });
 
-  it("setQuoteStatus propaga el error de la tabla", async () => {
-    fake.on("quotes.update", () => fail("new row violates row-level security policy"));
-    await expect(state().setQuoteStatus("q-1", "aceptada")).rejects.toThrow("row-level security");
+  it("setQuoteStatus propaga el error de la RPC", async () => {
+    fake.on("rpc.set_quote_status", () => fail("Cotización no encontrada"));
+    await expect(state().setQuoteStatus("q-1", "aceptada")).rejects.toThrow("Cotización no encontrada");
   });
 
   it("convertQuote llama convert_quote con p_quote y p_deposit, y recarga cotizaciones y existencias", async () => {
@@ -1212,7 +1311,7 @@ describe("cotizaciones", () => {
 describe("negocio y equipo", () => {
   beforeEach(() => {
     signIn();
-    useErp.setState({ business: { id: BUSINESS_ID, name: "Boutique Aurora", inviteCode: "ABCD2345", orderPrefix: "V-", quotePrefix: "COT-" } });
+    useErp.setState({ business: { id: BUSINESS_ID, name: "Boutique Aurora", kind: "boutique", inviteCode: "ABCD2345", orderPrefix: "V-", quotePrefix: "COT-" } });
   });
 
   it("saveBusiness llama update_business con p_name, p_order_prefix y p_quote_prefix", async () => {
@@ -1220,7 +1319,7 @@ describe("negocio y equipo", () => {
     await state().saveBusiness({ name: "Nueva Boutique", orderPrefix: "P-", quotePrefix: "C-" });
 
     expect(onlyRpc("update_business").args).toEqual({ p_name: "Nueva Boutique", p_order_prefix: "P-", p_quote_prefix: "C-" });
-    expect(state().business).toEqual({ id: BUSINESS_ID, name: "Nueva Boutique", inviteCode: "ABCD2345", orderPrefix: "P-", quotePrefix: "C-" });
+    expect(state().business).toEqual({ id: BUSINESS_ID, name: "Nueva Boutique", kind: "boutique", inviteCode: "ABCD2345", orderPrefix: "P-", quotePrefix: "C-" });
   });
 
   it("saveBusiness propaga el error y conserva el negocio", async () => {
@@ -1252,12 +1351,18 @@ describe("negocio y equipo", () => {
     expect(state().business?.inviteCode).toBe("ABCD2345");
   });
 
-  it("loadTeam lee los perfiles ordenados por antigüedad", async () => {
-    fake.tables.profiles = [profileRow(), profileRow({ id: "u-2", name: "Beto", role: "vendedor", branch: "br-2" })];
+  it("loadTeam lee las membresías con sus perfiles, ordenadas por antigüedad", async () => {
+    fake.tables.business_members = [
+      memberRow({ profiles: { name: "Ana Dueña", email: "ana@boutique.mx" } }),
+      memberRow({ user_id: "u-2", role: "vendedor", branch: "br-2", profiles: { name: "Beto", email: null } }),
+    ];
     await state().loadTeam();
-    const [call] = tableCalls("profiles");
+    const [call] = tableCalls("business_members");
     expect(opArgs(call, "order")).toEqual(["created_at", { ascending: true }]);
-    expect(state().team.map((m) => m.id)).toEqual(["u-1", "u-2"]);
+    expect(state().team.map((m) => [m.id, m.name, m.role, m.branch])).toEqual([
+      ["u-1", "Ana Dueña", "dueno", null],
+      ["u-2", "Beto", "vendedor", "br-2"],
+    ]);
   });
 
   it("setMember llama set_member con p_id, p_role y p_branch y reemplaza solo a ese integrante", async () => {
@@ -1267,7 +1372,7 @@ describe("negocio y equipo", () => {
         { ...PROFILE, id: "u-3", name: "Caro", role: "pendiente" },
       ],
     });
-    fake.on("rpc.set_member", () => ok(profileRow({ id: "u-2", name: "Beto", role: "vendedor", branch: "br-2" })));
+    fake.on("rpc.set_member", () => ok(memberRow({ user_id: "u-2", role: "vendedor", branch: "br-2" })));
 
     await state().setMember("u-2", "vendedor", "br-2");
 
@@ -1280,7 +1385,7 @@ describe("negocio y equipo", () => {
 
   it("setMember permite sucursal null", async () => {
     useErp.setState({ team: [{ ...PROFILE, id: "u-2", role: "vendedor", branch: "br-2" }] });
-    fake.on("rpc.set_member", () => ok(profileRow({ id: "u-2", role: "vendedor", branch: null })));
+    fake.on("rpc.set_member", () => ok(memberRow({ user_id: "u-2", role: "vendedor", branch: null })));
 
     await state().setMember("u-2", "vendedor", null);
 

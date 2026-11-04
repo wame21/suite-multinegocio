@@ -5,19 +5,20 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
-import { BrandLockup } from "@/components/brand";
 import { EmptyState, PageHeader } from "@/components/erp";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { SuiteLockup } from "@/components/ui/suite-lockup";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { KIND_LABEL } from "@/lib/constants";
 import { fDate, mxn } from "@/lib/format";
 import { STATE_LABELS, daysLeft } from "@/lib/membership";
 import { supabase } from "@/lib/supabase/client";
-import type { MembershipState } from "@/lib/types";
+import type { BusinessKind, MembershipState } from "@/lib/types";
 import { ActionDialog, SettingsDialog, type Action, type AdminBusiness, type PlatformSettings } from "./_components/dialogs";
 
 const STATES = Object.keys(STATE_LABELS) as MembershipState[];
@@ -43,6 +44,7 @@ export default function AdminPage() {
   const [rows, setRows] = useState<AdminBusiness[] | null>(null);
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState<MembershipState | "todos">("todos");
+  const [kind, setKind] = useState<BusinessKind | "todos">("todos");
   const [target, setTarget] = useState<{ biz: AdminBusiness; action: Action } | null>(null);
   const [settings, setSettings] = useState<PlatformSettings | null>(null);
   const [editingSettings, setEditingSettings] = useState(false);
@@ -78,9 +80,10 @@ export default function AdminPage() {
     return (rows ?? []).filter(
       (r) =>
         (filter === "todos" || r.state === filter) &&
+        (kind === "todos" || r.kind === kind) &&
         (!t || `${r.name} ${r.owner_name ?? ""} ${r.owner_email ?? ""}`.toLowerCase().includes(t)),
     );
-  }, [rows, q, filter]);
+  }, [rows, q, filter, kind]);
 
   const quick = async (fn: "admin_reactivate" | "admin_approve", b: AdminBusiness, ok: string) => {
     const { error } = await supabase().rpc(fn, { p_business: b.id });
@@ -99,11 +102,11 @@ export default function AdminPage() {
   return (
     <div className="min-h-screen">
       <header className="m-3 flex items-center justify-between gap-3 rounded-[20px] border border-sidebar-border bg-sidebar bg-(image:--glass-sheen) px-4 py-3 text-sidebar-foreground shadow-(--glass-shadow) backdrop-blur-[28px] backdrop-saturate-[1.85]">
-        <BrandLockup />
+        <SuiteLockup />
         <div className="flex shrink-0 items-center gap-2">
-          <Button asChild variant="outline" size="sm" className="text-foreground" aria-label="Ir a mi negocio">
-            <Link href="/">
-              <Store /> <span className="hidden sm:inline">Ir a mi negocio</span>
+          <Button asChild variant="outline" size="sm" className="text-foreground" aria-label="Ir a mis negocios">
+            <Link href="/negocios">
+              <Store /> <span className="hidden sm:inline">Ir a mis negocios</span>
             </Link>
           </Button>
           <Button variant="outline" size="sm" className="text-foreground" aria-label="Cerrar sesión" onClick={() => void signOut()}>
@@ -139,6 +142,19 @@ export default function AdminPage() {
             <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
             <Input className="pl-8" placeholder="Buscar por negocio o correo" value={q} onChange={(e) => setQ(e.target.value)} />
           </div>
+          <Select value={kind} onValueChange={(v) => setKind(v as BusinessKind | "todos")}>
+            <SelectTrigger className="w-full sm:w-48" aria-label="Giro">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="todos">Todos los giros</SelectItem>
+              {(Object.keys(KIND_LABEL) as BusinessKind[]).map((k) => (
+                <SelectItem key={k} value={k}>
+                  {KIND_LABEL[k]}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <Select value={filter} onValueChange={(v) => setFilter(v as MembershipState | "todos")}>
             <SelectTrigger className="w-full sm:w-48">
               <SelectValue />
@@ -164,6 +180,7 @@ export default function AdminPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead className="pl-4">Negocio</TableHead>
+                  <TableHead>Giro</TableHead>
                   <TableHead>Dueño</TableHead>
                   <TableHead>Estado</TableHead>
                   <TableHead>Vence</TableHead>
@@ -181,6 +198,7 @@ export default function AdminPage() {
                   return (
                     <TableRow key={b.id}>
                       <TableCell className="pl-4 font-medium">{b.name}</TableCell>
+                      <TableCell className="whitespace-nowrap">{KIND_LABEL[b.kind]}</TableCell>
                       <TableCell className="whitespace-nowrap">
                         {b.owner_name}
                         <div className="text-xs text-muted-foreground">{b.owner_email}</div>

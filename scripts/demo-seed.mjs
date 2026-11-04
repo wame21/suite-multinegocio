@@ -1,7 +1,7 @@
 // Datos de demo para grabar el video: una boutique con 2 sucursales, catálogo, inventario, ~3 meses de ventas,
 // clientes, cotizaciones de mayoreo y gastos. Pasa por las mismas RPC que la app; la llave de servicio solo
 // marca la membresía como pagada y mueve fechas al pasado (las RPC sellan todo con now()). Solo corre contra el Supabase LOCAL.
-// Uso: pnpm exec supabase db reset && pnpm db:demo
+// Uso: pnpm db:demo (una vez; si truena a medias borra lo que creó)
 import { service, user } from "./db-helpers.mjs";
 
 const OWNER = "demo@boutique.test";
@@ -101,7 +101,7 @@ const QUOTES = [
 // Negocio, membresía, configuración, sucursales y equipo
 // ---------------------------------------------------------------------------
 const owner = await user(OWNER, { name: "Mariana López", business_name: "Boutique Marea" }).catch((e) => {
-  throw new Error(`${e.message}. ¿Ya corriste el demo? Limpia con: pnpm exec supabase db reset`);
+  throw new Error(`${e.message}. ¿Ya corriste el demo? Borra antes las cuentas ${OWNER} y ${SELLER}`);
 });
 const db = owner.db;
 const biz = must(await db.from("businesses").select("*").single());
@@ -242,8 +242,11 @@ async function quote(t, label, picks, state, depositFrac) {
   const q = must(await db.rpc("save_quote", { p: {
     validUntil: iso(t + WHOLESALE.validityDays * DAY), customerId: customer.id, customerName: label, items, tierId: tier.id,
     subtotalList, discount: subtotalList - subtotal, subtotal, shipping, total, depositPct: WHOLESALE.depositPct,
-    status: state === "convertida" ? "aceptada" : state,
+    status: state === "borrador" ? "borrador" : "enviada",
   } }));
+  // save_quote solo guarda borrador o enviada; aceptada/rechazada pasan por set_quote_status como en la app.
+  const target = state === "convertida" ? "aceptada" : state;
+  if (target !== "borrador" && target !== "enviada") must(await db.rpc("set_quote_status", { p_id: q.id, p_status: target }));
   must(await service.from("quotes").update({ date: iso(t) }).eq("id", q.id));
   if (state !== "convertida") return;
 

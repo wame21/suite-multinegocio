@@ -22,6 +22,7 @@ import type {
   Branch,
   BranchId,
   Business,
+  BusinessKind,
   Channel,
   Customer,
   ErpData,
@@ -32,6 +33,7 @@ import type {
   MovementType,
   Order,
   OrderStatus,
+  OwnerBusiness,
   Payment,
   Product,
   Profile,
@@ -41,7 +43,7 @@ import type {
   StockMap,
   TierId,
 } from "./types";
-import { applyWholesaleSettings, wholesaleFrom, wholesaleSnapshot, type WholesaleSettings } from "./wholesale";
+import { applyWholesaleSettings, DEFAULT_WHOLESALE, wholesaleFrom, wholesaleSnapshot, type WholesaleSettings } from "./wholesale";
 
 export interface NewOrderInput {
   channel: Channel;
@@ -81,6 +83,10 @@ type Table = "products" | "stock" | "movements" | "orders" | "customers" | "quot
 
 interface Actions {
   init: () => Promise<void>;
+  /** Cambia el negocio activo (`set_active_business`) y recarga todo: store y canal realtime empiezan de cero. */
+  switchBusiness: (id: string) => Promise<void>;
+  /** Suelta datos y canal del negocio (al salir a Mis negocios). */
+  reset: () => Promise<void>;
   signOut: () => Promise<void>;
   reload: (tables: Table[]) => Promise<void>;
 
@@ -149,6 +155,10 @@ interface Session {
   live: boolean;
   /** `my_membership()`; `null` hasta que carga (o si la cuenta está pendiente). */
   membership: Membership | null;
+  /** Giro del negocio activo (boutique mientras no hay uno). */
+  kind: BusinessKind;
+  /** Fila de `my_businesses()` del negocio activo: nombre, giro y estado, también para el personal pendiente. */
+  active: OwnerBusiness | null;
 }
 
 type Data = ErpData & Config;
@@ -164,11 +174,23 @@ type Row = Record<string, any>;
 const opt = <T>(v: T | null | undefined) => v ?? undefined;
 const num = (v: unknown) => Number(v ?? 0);
 
-const toProfile = (r: Row): Profile => ({
+/** Persona (`profiles`) con su membresía en el negocio activo; sin membresía es una cuenta de dueño que aún no entra a un negocio. */
+const toProfile = (r: Row, m?: Row | null): Profile => ({
   id: r.id,
-  businessId: r.business_id,
+  businessId: m?.business_id ?? null,
   name: r.name,
   email: opt(r.email),
+  role: m?.role ?? "dueno",
+  branch: m?.branch ?? null,
+  createdAt: r.created_at,
+});
+
+/** Integrante de `business_members` con los datos de `profiles` unidos. */
+const toMember = (r: Row): Profile => ({
+  id: r.user_id,
+  businessId: r.business_id,
+  name: r.profiles?.name ?? "",
+  email: opt(r.profiles?.email),
   role: r.role,
   branch: r.branch ?? null,
   createdAt: r.created_at,
@@ -177,6 +199,7 @@ const toProfile = (r: Row): Profile => ({
 const toBusiness = (r: Row): Business => ({
   id: r.id,
   name: r.name,
+  kind: r.kind ?? "boutique",
   inviteCode: r.invite_code,
   orderPrefix: r.order_prefix,
   quotePrefix: r.quote_prefix,
@@ -410,6 +433,13 @@ async function loadBusiness(businessId: string) {
 const upsert = <T extends { id: string }>(list: T[], item: T) =>
   list.some((x) => x.id === item.id) ? list.map((x) => (x.id === item.id ? item : x)) : [...list, item];
 
+const emptySession = (): Pick<Session, "team" | "membership" | "kind" | "active" | "live"> => ({
+  team: [],
+  membership: null,
+  kind: "boutique",
+  active: null,
+  live: false,
+});
 const EMPTY: ErpData = { products: [], stock: {}, movements: [], orders: [], customers: [], quotes: [], expenses: [] };
 
 /** Mientras cargan, se usan los valores por defecto de cada configuración. */
@@ -423,6 +453,8 @@ const DEFAULT_CONFIG: Config = {
 };
 
 let channel: RealtimeChannel | undefined;
+/** Una sola carga a la vez: el shell y `switchBusiness` pueden pedirla casi juntos. */
+let initializing: Promise<void> | undefined;
 
 /** Recarga completa hacia /login: así no queda en memoria ningún dato del negocio. */
 function goToLogin() {
@@ -465,9 +497,12 @@ export const useErp = create<ErpState>()((set, get) => {
   const subscribe = () => {
     if (channel) return;
     channel = supabase().channel("erp");
-    for (const table of ["orders", "stock", "quotes", "customers", "products", "expenses", "branches", "settings"] as const)
-      channel.on("postgres_changes", { event: "*", schema: "public", table }, () => schedule(table));
-    if (get().role === "dueno") {
+    // Las tablas de boutique solo se escuchan en ese giro; el restaurante suscribe las suyas.
+    if (get().kind === "boutique") {
+      for (const table of ["orders", "stock", "quotes", "customers", "products", "expenses", "branches", "settings"] as const)
+        channel.on("postgres_changes", { event: "*", schema: "public", table }, () => schedule(table));
+    }
+    if (get().kind === "boutique" && get().role === "dueno") {
       channel.on("postgres_changes", { event: "*", schema: "public", table: "product_costs" }, () => {
         schedule("products");
         schedule("quotes");
@@ -494,43 +529,75 @@ export const useErp = create<ErpState>()((set, get) => {
     );
   };
 
+  const load = async () => {
+    set({ status: "loading", error: undefined });
+    try {
+      const sb = supabase();
+      const { data: auth } = await sb.auth.getUser();
+      if (!auth.user) return goToLogin();
+      const row = must(await sb.from("profiles").select("*").eq("id", auth.user.id).single()) as Row;
+      const activeId: string | null = row.active_business_id ?? null;
+      const [member, mine] = activeId
+        ? await Promise.all([
+            sb.from("business_members").select("*").eq("user_id", auth.user.id).eq("business_id", activeId).maybeSingle(),
+            sb.rpc("my_businesses"),
+          ])
+        : [null, null];
+      const profile = toProfile(row, member && (must(member) as Row | null));
+      const active = ((mine && must(mine)) as OwnerBusiness[] | null)?.find((b) => b.id === activeId) ?? null;
+      const kind = active?.kind ?? "boutique";
+      set({ profile, role: profile.role === "pendiente" ? "vendedor" : profile.role, kind, active });
+      // Cuenta de dueño sin negocio activo, o personal pendiente: no hay datos que cargar.
+      if (!profile.businessId || profile.role === "pendiente") {
+        set({ status: "ready" });
+        return;
+      }
+      const membership = must(await sb.rpc("my_membership")) as Membership;
+      set({ membership });
+      if (isBlocked(membership)) {
+        set({ status: "ready" });
+        return;
+      }
+      const owner = profile.role === "dueno";
+      // Las tablas de boutique y su canal solo se cargan en ese giro.
+      const [business, ...parts] = await Promise.all([
+        owner || kind === "boutique" ? loadBusiness(profile.businessId) : null,
+        ...(kind === "boutique" ? ALL_TABLES.map((t) => LOADERS[t](profile.businessId!, owner)) : []),
+      ]);
+      set({ ...Object.assign({}, ...parts), business, status: "ready" });
+      subscribe();
+    } catch (e) {
+      set({ status: "error", error: errorMessage(e) });
+    }
+  };
+
   return {
     ...EMPTY,
     ...DEFAULT_CONFIG,
+    ...emptySession(),
     status: "loading",
     profile: null,
     role: "vendedor",
-    team: [],
-    live: false,
-    membership: null,
 
-    init: async () => {
-      set({ status: "loading", error: undefined });
-      try {
-        const sb = supabase();
-        const { data: auth } = await sb.auth.getUser();
-        if (!auth.user) return goToLogin();
-        const profile = toProfile(must(await sb.from("profiles").select("*").eq("id", auth.user.id).single()));
-        set({ profile, role: profile.role === "dueno" ? "dueno" : "vendedor" });
-        if (profile.role === "pendiente") {
-          set({ status: "ready" });
-          return;
-        }
-        const membership = must(await sb.rpc("my_membership")) as Membership;
-        set({ membership });
-        if (isBlocked(membership)) {
-          set({ status: "ready" });
-          return;
-        }
-        const [business, ...parts] = await Promise.all([
-          loadBusiness(profile.businessId),
-          ...ALL_TABLES.map((t) => LOADERS[t](profile.businessId, profile.role === "dueno")),
-        ]);
-        set({ ...Object.assign({}, ...parts), business, status: "ready" });
-        subscribe();
-      } catch (e) {
-        set({ status: "error", error: errorMessage(e) });
-      }
+    init: () => (initializing ??= load().finally(() => (initializing = undefined))),
+
+    switchBusiness: async (id) => {
+      must(await supabase().rpc("set_active_business", { p_id: id }));
+      await get().reset();
+      await get().init();
+    },
+
+    reset: async () => {
+      if (channel) await supabase().removeChannel(channel);
+      channel = undefined;
+      for (const t of pending.values()) clearTimeout(t);
+      pending.clear();
+      // la configuración de módulo del negocio anterior no debe filtrarse al siguiente
+      applyBranches([]);
+      applyCatalogSettings(catalogFrom(undefined));
+      applySalesSettings(salesFrom(undefined));
+      applyWholesaleSettings(DEFAULT_WHOLESALE);
+      set({ ...EMPTY, ...DEFAULT_CONFIG, ...emptySession(), profile: null, role: "vendedor", status: "loading", error: undefined });
     },
 
     signOut: async () => {
@@ -619,7 +686,7 @@ export const useErp = create<ErpState>()((set, get) => {
     },
 
     setQuoteStatus: async (id, status) => {
-      const quote = toQuote(must(await supabase().from("quotes").update({ status }).eq("id", id).select().single()));
+      const quote = toQuote(must(await supabase().rpc("set_quote_status", { p_id: id, p_status: status })) as Row);
       set((s) => ({ quotes: upsert(s.quotes, quote) }));
     },
 
@@ -649,13 +716,16 @@ export const useErp = create<ErpState>()((set, get) => {
     },
 
     loadTeam: async () => {
-      const rows = must(await supabase().from("profiles").select("*").order("created_at", { ascending: true }));
-      set({ team: rows.map(toProfile) });
+      const rows = must(
+        await supabase().from("business_members").select("*, profiles(name, email)").order("created_at", { ascending: true }),
+      ) as Row[];
+      set({ team: rows.map(toMember) });
     },
 
     setMember: async (id, role, branch) => {
-      const profile = toProfile(must(await supabase().rpc("set_member", { p_id: id, p_role: role, p_branch: branch })) as Row);
-      set((s) => ({ team: s.team.map((m) => (m.id === id ? profile : m)) }));
+      // set_member devuelve la fila de business_members, sin los datos de la persona: se conservan los que ya están
+      const row = must(await supabase().rpc("set_member", { p_id: id, p_role: role, p_branch: branch })) as Row;
+      set((s) => ({ team: s.team.map((m) => (m.id === id ? { ...m, role: row.role, branch: row.branch ?? null } : m)) }));
     },
 
     saveBusiness: async (b) => {
@@ -756,8 +826,14 @@ export const useErp = create<ErpState>()((set, get) => {
 /* ------------------------------------------------------------------ */
 export const useIsOwner = () => useErp((s) => s.role === "dueno");
 
+/** Dueño o encargado: mueven inventario (entradas, ajustes, conteos y traspasos). */
+export const useCanMoveStock = () => useErp((s) => s.role === "dueno" || s.role === "encargado");
+
+/** La base aplica la misma regla a cancelar pedidos que a mover inventario. */
+export const useCanCancelOrders = useCanMoveStock;
+
 /** Nombre del negocio; mientras carga (o sin sesión) el del producto. */
-export const useBusinessName = () => useErp((s) => s.business?.name ?? APP_NAME);
+export const useBusinessName = () => useErp((s) => s.business?.name ?? s.active?.name ?? APP_NAME);
 
 /** Todas las sucursales, también las archivadas (para resolver nombres de datos históricos). */
 export const useBranches = () => useErp((s) => s.branches);
